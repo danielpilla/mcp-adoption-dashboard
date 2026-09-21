@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.css text eol=lf whitespace=cr-at-eol
+*.json text eol=lf whitespace=cr-at-eol
+*.md text eol=lf whitespace=cr-at-eol
+*.ts text eol=lf whitespace=cr-at-eol
+*.tsx text eol=lf whitespace=cr-at-eol
