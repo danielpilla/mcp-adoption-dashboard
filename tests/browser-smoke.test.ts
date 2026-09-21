@@ -986,6 +986,12 @@ try {
     if ((await dialog.locator(".drawer-filter-controls").count()) !== 1) {
       throw new Error("Drawer is missing persistent scope controls");
     }
+    const scopeControlsOverflow = await dialog
+      .locator(".drawer-filter-controls")
+      .evaluate((element) => element.scrollWidth > element.clientWidth + 1);
+    if (scopeControlsOverflow) {
+      throw new Error("Drawer scope controls overflow their panel");
+    }
     await page.getByRole("button", { name: "Close KPI details" }).click();
   }
   await page.getByRole("button", { name: "Explore MCP–tool pairs" }).click();
