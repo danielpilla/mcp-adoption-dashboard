@@ -60,15 +60,16 @@ inspection may expose it. For non-interactive deployments, provide
 The server loads `.env` when present. [`.env.example`](.env.example) is the
 complete application configuration reference.
 
-| Variable                        | Type            | Default     | Required                  | Purpose                                                                   |
-| ------------------------------- | --------------- | ----------- | ------------------------- | ------------------------------------------------------------------------- |
-| `CURSOR_API_KEY`                | string          | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                              |
-| `CURSOR_TEAM_NAME`              | string          | empty       | No                        | Display label because the API returns a team ID, not its display name.    |
-| `PORT`                          | integer         | `5173`      | No                        | Vite development UI port.                                                 |
-| `SERVER_PORT`                   | integer         | `4173`      | No                        | API and production application port.                                      |
-| `BIND_HOST`                     | hostname or IP  | `127.0.0.1` | No                        | Network interface used by development and production servers.             |
-| `ALLOW_UNAUTHENTICATED_NETWORK` | literal `1`     | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control. |
-| `INTERNAL_MCP_SERVERS`          | comma-separated | empty       | No                        | Additional organization-specific MCP labels classified as internal.       |
+| Variable                        | Type                  | Default     | Required                  | Purpose                                                                                               |
+| ------------------------------- | --------------------- | ----------- | ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `CURSOR_API_KEY`                | string                | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                                                          |
+| `CURSOR_TEAM_NAME`              | string                | empty       | No                        | Display label because the API returns a team ID, not its display name.                                |
+| `PORT`                          | integer               | `5173`      | No                        | Vite development UI port.                                                                             |
+| `SERVER_PORT`                   | integer               | `4173`      | No                        | API and production application port.                                                                  |
+| `BIND_HOST`                     | hostname or IP        | `127.0.0.1` | No                        | Network interface used by development and production servers.                                         |
+| `ALLOW_UNAUTHENTICATED_NETWORK` | literal `1`           | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control.                             |
+| `INTERNAL_MCP_SERVERS`          | comma-separated       | empty       | No                        | Additional organization-specific MCP labels classified as internal.                                   |
+| `DEFAULT_RANGE_DAYS`            | integer from 1 to 366 | `90`        | No                        | Length in days of the range the dashboard loads first. An invalid value logs a warning and uses `90`. |
 
 ### Optional caps and timeouts
 

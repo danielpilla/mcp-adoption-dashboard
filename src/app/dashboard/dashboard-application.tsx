@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { DEFAULT_RANGE_DAYS } from "../../contracts/date-range-days";
 import {
   summarizeMcpRecords,
   type McpResponse,
@@ -63,14 +64,17 @@ function comparisonTone(value: number | null): DashboardKpiView["deltaTone"] {
 
 export function App({
   initialData,
+  defaultRangeDays = DEFAULT_RANGE_DAYS,
   onSetupRequired,
 }: {
   initialData: McpResponse | null;
+  /** Inclusive length of the range used when no data has been loaded. */
+  defaultRangeDays?: number;
   onSetupRequired?: () => void;
 }) {
   const initialRange = useMemo(
-    () => initialData?.range ?? presetRange(90),
-    [initialData?.range],
+    () => initialData?.range ?? presetRange(defaultRangeDays),
+    [initialData?.range, defaultRangeDays],
   );
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
   const [selectedKpi, setSelectedKpi] = useState<KpiType | null>(null);

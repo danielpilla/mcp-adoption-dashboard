@@ -113,6 +113,7 @@ const app = createApp({
   directoryTimeoutMs: settings.directoryTimeoutMs,
   activityStore,
   shutdownSignal: shutdownController.signal,
+  defaultRangeDays: settings.defaultRangeDays,
 });
 
 /*

@@ -1,3 +1,7 @@
+import {
+  DEFAULT_RANGE_DAYS,
+  isRangeDays,
+} from "../../contracts/date-range-days";
 import type { DateRange } from "../../contracts/mcp-response";
 
 const UTC_MIDNIGHT_SUFFIX = "T00:00:00.000Z";
@@ -42,6 +46,11 @@ export function presetRange(days: number): DateRange {
   const start = new Date(end);
   start.setUTCDate(end.getUTCDate() - days + 1);
   return { startDate: isoDate(start), endDate: isoDate(end) };
+}
+
+/** Returns the configured initial range length, or the default when invalid. */
+export function initialRangeDays(value: unknown): number {
+  return isRangeDays(value) ? value : DEFAULT_RANGE_DAYS;
 }
 
 export function rangeLabel(startDate: string, endDate: string): string {

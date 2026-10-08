@@ -6,8 +6,9 @@ The dashboard is organized into Dashboard, Analysis, and Reporting views. The
 scope bar preserves filters while moving between views and provides the single
 **Clear selections** action.
 
-The initial range is 90 days. Choose a preset or valid custom UTC range to
-reload data. **Refresh** bypasses the 12-hour server cache while preserving
+The initial range is the last `DEFAULT_RANGE_DAYS` days (default 90). A
+value other than 7, 30, or 90 is shown as a custom range. Choose a preset or
+valid custom UTC range to reload data. **Refresh** bypasses the 12-hour server cache while preserving
 the current date drill-down and associative selections. Refreshes for the same
 range are limited to once every 10 seconds.
 

@@ -29,7 +29,13 @@ startup validation was deferred can temporarily produce `configured: true` on
 
 ### `GET /api/setup/status`
 
-Returns whether an API key is configured and whether browser setup is allowed.
+Returns whether an API key is configured, whether browser setup is allowed,
+and the length in days of the range the dashboard loads first
+(`DEFAULT_RANGE_DAYS`, default `90`):
+
+```json
+{ "configured": true, "setupAllowed": true, "defaultRangeDays": 90 }
+```
 
 ### `POST /api/setup`
 

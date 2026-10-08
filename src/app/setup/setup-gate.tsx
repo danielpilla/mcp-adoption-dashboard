@@ -7,7 +7,8 @@ import {
 } from "react";
 import type { McpResponse } from "../../contracts/mcp-response";
 import { App } from "../dashboard/dashboard-application";
-import { presetRange } from "../dashboard/dashboard-dates";
+import { DEFAULT_RANGE_DAYS } from "../../contracts/date-range-days";
+import { initialRangeDays, presetRange } from "../dashboard/dashboard-dates";
 import {
   DashboardSetupRequiredError,
   readDashboardStream,
@@ -27,6 +28,7 @@ import { useDialogFocusTrap } from "../interface/dialog-focus-trap";
 type SetupStatus = {
   configured: boolean;
   setupAllowed: boolean;
+  defaultRangeDays: number;
 };
 
 type SetupView =
@@ -72,6 +74,7 @@ export function SetupGate({
   const [showKey, setShowKey] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [rangeDays, setRangeDays] = useState(DEFAULT_RANGE_DAYS);
   const [loadProgress, setLoadProgress] = useState<DashboardLoadProgress>({
     completed: 0,
     total: 1,
@@ -84,7 +87,8 @@ export function SetupGate({
     view,
   );
 
-  const loadDashboard = useCallback(async () => {
+  const loadDashboard = useCallback(async (days: number) => {
+    setRangeDays(days);
     setView("loading");
     setError("");
     setLoadProgress({
@@ -94,7 +98,7 @@ export function SetupGate({
       detail: "Connecting to Cursor",
     });
     try {
-      const range = presetRange(90);
+      const range = presetRange(days);
       const query = new URLSearchParams({
         startDate: range.startDate,
         endDate: range.endDate,
@@ -169,9 +173,11 @@ export function SetupGate({
       const status: SetupStatus = {
         configured: body.configured,
         setupAllowed: body.setupAllowed,
+        defaultRangeDays: initialRangeDays(body.defaultRangeDays),
       };
+      setRangeDays(status.defaultRangeDays);
       if (status.configured) {
-        await loadDashboard();
+        await loadDashboard(status.defaultRangeDays);
       } else {
         setView(status.setupAllowed ? "required" : "blocked");
       }
@@ -221,7 +227,7 @@ export function SetupGate({
         );
       }
       setApiKey("");
-      await loadDashboard();
+      await loadDashboard(rangeDays);
     } catch (setupError) {
       setError(
         setupError instanceof Error
@@ -237,7 +243,11 @@ export function SetupGate({
     <>
       {(view === "configured" || view === "revealing") && dashboardData && (
         <div>
-          <App initialData={dashboardData} onSetupRequired={requireSetup} />
+          <App
+            initialData={dashboardData}
+            defaultRangeDays={rangeDays}
+            onSetupRequired={requireSetup}
+          />
         </div>
       )}
       {view !== "configured" && (
@@ -287,7 +297,7 @@ export function SetupGate({
             <div className="setup-modal-copy">
               <span className="eyebrow">
                 {view === "loading" || view === "revealing"
-                  ? "90-day view"
+                  ? `${rangeDays}-day view`
                   : "Local setup"}
               </span>
               <h1 id="setup-title">
