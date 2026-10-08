@@ -24,6 +24,12 @@ import { isLoopbackHost } from "../configuration/server-configuration.js";
 import { DEFAULT_RUNTIME_SETTINGS } from "../configuration/runtime-settings.js";
 import { validateDateRange } from "../analytics/analytics-date-range.js";
 import {
+  daysBetween,
+  parseStartupRange,
+  type CacheCoverage,
+} from "../../contracts/startup-range.js";
+import type { StartupRangeStorage } from "../configuration/startup-range-store.js";
+import {
   TeamMetadataCache,
   type DirectorySnapshot,
 } from "../cursor/team-metadata-cache.js";
@@ -37,6 +43,8 @@ import {
 /** Disk-backed activity storage bound to the active API key. */
 interface ActivityStore extends McpRunFactory {
   activate(apiKey: string): Promise<void>;
+  /** Cached-day coverage, computed without reading day files. */
+  coverage?(): CacheCoverage;
 }
 
 interface AppOptions {
@@ -71,11 +79,14 @@ interface AppOptions {
   activityStore?: ActivityStore;
   loopbackOnly?: boolean;
   shutdownSignal?: AbortSignal;
-  /** Inclusive length of the range the dashboard loads first. */
+  /** Inclusive length of the range pre-selected at startup when none is remembered. */
   defaultRangeDays?: number;
+  /** Remembers the range chosen at startup. */
+  startupRanges?: StartupRangeStorage;
 }
 
 interface AnalyticsCacheEntry {
+  startedAt: number;
   expiresAt: number;
   value: Promise<McpDataset>;
   controller?: AbortController;
@@ -108,6 +119,28 @@ const DEFAULT_MAX_CONCURRENT_ANALYTICS = 4;
 const DEFAULT_DIRECTORY_GRACE_MS = 2_000;
 const REFRESH_COOLDOWN_MS = 10_000;
 const JSON_BODY_LIMIT = "4kb";
+
+/** The `activity` object of a stream progress event. */
+interface ActivityProgressEvent {
+  state: "loading" | "reused" | "ready";
+  totalDays: number;
+  cachedDays: number;
+  fetchedDays: number;
+  records: number;
+  completedWindows: number;
+  totalWindows: number;
+  windows: NonNullable<McpFetchProgress["activeWindows"]>;
+  retry: {
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    waitedMs: number;
+    reason: string;
+    status: number | null;
+  } | null;
+  elapsedMs: number;
+  idleMs: number;
+}
 const CONFIGURATION_SUPERSEDED_RESPONSE = {
   error: "A newer API key update was submitted. Retry if needed.",
   code: "CONFIGURATION_SUPERSEDED",
@@ -280,6 +313,7 @@ export function createApp({
   loopbackOnly,
   shutdownSignal,
   defaultRangeDays = DEFAULT_RUNTIME_SETTINGS.defaultRangeDays,
+  startupRanges,
 }: AppOptions) {
   const app = express();
   let activeClient = initialClient ?? null;
@@ -489,6 +523,7 @@ export function createApp({
     const result = deferred<McpDataset>();
     const entry: AnalyticsCacheEntry = {
       controller,
+      startedAt: now,
       expiresAt: now + cacheTtlMs,
       progress: { completedWindows: 0, totalWindows: 0 },
       progressEvents: [],
@@ -500,8 +535,17 @@ export function createApp({
       value: result.promise,
     };
     const onProgress = (progress: McpFetchProgress) => {
+      const previous = entry.progressEvents.at(-1);
       entry.progress = progress;
-      entry.progressEvents.push(progress);
+      // Late subscribers replay window-level steps; page updates only
+      // replace the latest progress so the history stays bounded.
+      if (
+        !previous ||
+        previous.completedWindows !== progress.completedWindows ||
+        previous.totalWindows !== progress.totalWindows
+      ) {
+        entry.progressEvents.push(progress);
+      }
       for (const listener of entry.progressListeners) listener();
     };
     ensureDirectory(snapshot, now);
@@ -693,12 +737,44 @@ export function createApp({
   app.get("/api/ready", readiness);
   app.get("/api/health/ready", readiness);
 
-  app.get("/api/setup/status", (_request, response) => {
+  app.get("/api/setup/status", async (_request, response) => {
+    // A preference that cannot be read only disables remembering it.
+    const rangePreference = startupRanges
+      ? await startupRanges.read().catch(() => null)
+      : null;
     response.json({
       configured: Boolean(activeClient),
       setupAllowed: Boolean(setup?.allowed),
       defaultRangeDays,
+      rangePreference,
+      cacheCoverage: activityStore?.coverage?.() ?? null,
     });
+  });
+
+  app.put("/api/setup/range", parseSetupBody, async (request, response) => {
+    const range = parseStartupRange(request.body);
+    if (!range) {
+      response.status(400).json({
+        error:
+          "Send a preset of 1 to 366 days or a custom range of at most 366 days.",
+      });
+      return;
+    }
+    if (!startupRanges) {
+      response
+        .status(503)
+        .json({ error: "The startup range cannot be saved on this server." });
+      return;
+    }
+    try {
+      await startupRanges.write(range);
+    } catch {
+      response
+        .status(503)
+        .json({ error: "The startup range could not be saved." });
+      return;
+    }
+    response.json({ rangePreference: range });
   });
 
   app.get("/api/directory/status", (_request, response) => {
@@ -836,9 +912,50 @@ export function createApp({
     let completedWindows = 0;
     let totalWindows = 0;
     let cachedDays = 0;
+    let latestProgress: McpFetchProgress = activeEntry.progress;
     let progressLabel = "Starting";
     let progressDetail = "Connecting to Cursor";
     const progressStartedAt = Date.now();
+    const rangeDays = daysBetween(startDate, endDate);
+    const activity = (
+      state: ActivityProgressEvent["state"],
+      records = latestProgress.records ?? 0,
+    ): ActivityProgressEvent => {
+      const now = Date.now();
+      const retry = state === "loading" ? latestProgress.retry : undefined;
+      return {
+        state,
+        totalDays: rangeDays,
+        cachedDays,
+        fetchedDays:
+          state === "loading"
+            ? (latestProgress.fetchedDays ?? 0)
+            : Math.max(0, rangeDays - cachedDays),
+        records,
+        completedWindows,
+        totalWindows,
+        windows:
+          state === "loading" ? (latestProgress.activeWindows ?? []) : [],
+        retry: retry
+          ? {
+              attempt: retry.attempt,
+              maxAttempts: retry.maxAttempts,
+              delayMs: retry.delayMs,
+              waitedMs: Math.max(0, now - retry.startedAt),
+              reason: retry.reason,
+              status: retry.status ?? null,
+            }
+          : null,
+        elapsedMs: Math.max(0, now - activeEntry.startedAt),
+        idleMs:
+          state === "loading"
+            ? Math.max(
+                0,
+                now - (latestProgress.lastActivityAt ?? activeEntry.startedAt),
+              )
+            : 0,
+      };
+    };
     const progressEvent = (label: string, detail: string) => ({
       type: "progress",
       completed: completedWindows,
@@ -846,6 +963,7 @@ export function createApp({
       label,
       detail,
       directory: directoryProgress(teamMetadataCache.snapshot()),
+      activity: activity(activeEntry.settled ? "reused" : "loading"),
     });
     const emitProgress = (label: string, detail: string) => {
       progressLabel = label;
@@ -885,6 +1003,7 @@ export function createApp({
       );
     };
     const applyProgress = (progress: McpFetchProgress) => {
+      latestProgress = progress;
       completedWindows = progress.completedWindows;
       totalWindows = progress.totalWindows;
       cachedDays = progress.cachedDays ?? 0;
@@ -907,6 +1026,9 @@ export function createApp({
           applyProgress(progress);
           emitCurrentProgress();
         }
+        if (activeEntry.progress !== activeEntry.progressEvents.at(-1)) {
+          syncProgress();
+        }
       }
       const dataset = await activeEntry.value;
       removeProgressListener();
@@ -919,6 +1041,7 @@ export function createApp({
         label: "Ready",
         detail: `${formatCount(dataset.recordCount)} activity rows`,
         directory: directoryProgress(teamMetadataCache.snapshot()),
+        activity: activity("ready", dataset.recordCount),
       });
       clearInterval(heartbeat);
       stopDirectoryUpdates();

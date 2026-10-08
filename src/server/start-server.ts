@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CursorApiClient } from "./cursor/cursor-api.js";
 import { McpDayCache } from "./cache/mcp-day-cache.js";
@@ -10,6 +10,7 @@ import {
   parsePort,
 } from "./configuration/server-configuration.js";
 import { readRuntimeSettings } from "./configuration/runtime-settings.js";
+import { StartupRangeFile } from "./configuration/startup-range-store.js";
 import {
   validateSavedClient,
   writeSetupEnv,
@@ -78,6 +79,13 @@ if (activityStore && apiKey) {
     );
 }
 
+// The startup range is kept in the cache directory, which is writable here.
+const startupRanges = activityStore
+  ? new StartupRangeFile(
+      join(resolve(settings.mcpCache.directory), "startup-range.json"),
+    )
+  : undefined;
+
 const client = apiKey ? createClient(apiKey) : undefined;
 const shutdownController = new AbortController();
 const validationSignal = () =>
@@ -114,6 +122,7 @@ const app = createApp({
   activityStore,
   shutdownSignal: shutdownController.signal,
   defaultRangeDays: settings.defaultRangeDays,
+  startupRanges,
 });
 
 /*

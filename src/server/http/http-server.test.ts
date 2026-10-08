@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "./http-server";
 import { McpDayCache } from "../cache/mcp-day-cache";
+import { StartupRangeFile } from "../configuration/startup-range-store";
 import {
   CursorApiClient,
   CursorApiError,
@@ -788,6 +789,110 @@ describe("MCP API endpoint", () => {
     expect(events.at(-1)?.type).toBe("data");
   });
 
+  it("streams day, record, window, and retry fields with progress", async () => {
+    const client = new CursorApiClient("test-key");
+    const window = {
+      startDate: "2026-09-06",
+      endDate: "2026-09-18",
+      days: 13,
+      pagesLoaded: 1,
+      totalPages: 3,
+    };
+    vi.spyOn(client, "fetchMcp").mockImplementation(
+      async (_startDate, _endDate, _memberNames, onProgress) => {
+        const startedAt = Date.now();
+        onProgress?.({
+          completedWindows: 0,
+          totalWindows: 1,
+          cachedDays: 5,
+          totalDays: 18,
+          fetchedDays: 0,
+          records: 40,
+          activeWindows: [window],
+          retry: {
+            attempt: 2,
+            maxAttempts: 5,
+            delayMs: 2_000,
+            reason: "rate_limited",
+            status: 429,
+            startedAt,
+          },
+          lastActivityAt: startedAt,
+        });
+        onProgress?.({
+          completedWindows: 1,
+          totalWindows: 1,
+          cachedDays: 5,
+          totalDays: 18,
+          fetchedDays: 13,
+          records: 90,
+          activeWindows: [],
+          lastActivityAt: Date.now(),
+        });
+        return structuredClone(emptyMcpResponse);
+      },
+    );
+    const baseUrl = await listen(
+      createApp({ client, loadTeamMetadata: false }),
+    );
+
+    const response = await fetch(
+      `${baseUrl}/api/mcp/stream?startDate=2026-09-01&endDate=2026-09-18`,
+    );
+    const events = (await response.text())
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            type: string;
+            completed?: number;
+            activity?: Record<string, unknown>;
+          },
+      );
+    const progress = events.filter((event) => event.type === "progress");
+
+    expect(progress[0]?.activity).toEqual({
+      state: "loading",
+      totalDays: 18,
+      cachedDays: 5,
+      fetchedDays: 0,
+      records: 40,
+      completedWindows: 0,
+      totalWindows: 1,
+      windows: [window],
+      retry: {
+        attempt: 2,
+        maxAttempts: 5,
+        delayMs: 2_000,
+        waitedMs: expect.any(Number),
+        reason: "rate_limited",
+        status: 429,
+      },
+      elapsedMs: expect.any(Number),
+      idleMs: expect.any(Number),
+    });
+    expect(progress[1]?.activity).toMatchObject({
+      state: "loading",
+      fetchedDays: 13,
+      records: 90,
+      completedWindows: 1,
+      windows: [],
+      retry: null,
+    });
+    expect(progress.at(-1)?.activity).toMatchObject({
+      state: "ready",
+      totalDays: 18,
+      cachedDays: 5,
+      fetchedDays: 13,
+      records: 0,
+      windows: [],
+      retry: null,
+      idleMs: 0,
+    });
+    expect(events.at(-1)?.type).toBe("data");
+  });
+
   it("streams directory progress and waits briefly for a finishing directory", async () => {
     const client = new CursorApiClient("test-key");
     const metadataResult = deferred<TeamMetadata>();
@@ -1217,6 +1322,162 @@ describe("MCP API with the day cache", () => {
   });
 });
 
+describe("startup range endpoints", () => {
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      directories
+        .splice(0)
+        .map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+  });
+
+  async function tempDirectory() {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-startup-range-"));
+    directories.push(directory);
+    return directory;
+  }
+
+  async function putRange(baseUrl: string, body: unknown) {
+    return fetch(`${baseUrl}/api/setup/range`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("reports day-cache coverage in setup status", async () => {
+    const directory = await tempDirectory();
+    const store = new McpDayCache({
+      directory,
+      maxBytes: 1024 * 1024,
+      refetchDays: 2,
+    });
+    await store.open();
+    await store.activate("test-key");
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      dailyActivityFetcher(),
+    );
+    const baseUrl = await listen(
+      createApp({ client, loadTeamMetadata: false, activityStore: store }),
+    );
+
+    const empty = (await (
+      await fetch(`${baseUrl}/api/setup/status`)
+    ).json()) as { cacheCoverage: Record<string, unknown> };
+    expect(empty.cacheCoverage).toEqual({
+      firstDate: null,
+      lastDate: null,
+      days: 0,
+      cacheableThrough: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+      spans: [],
+    });
+
+    await (
+      await fetch(`${baseUrl}/api/mcp?startDate=2026-09-01&endDate=2026-09-05`)
+    ).json();
+    await (
+      await fetch(`${baseUrl}/api/mcp?startDate=2026-09-08&endDate=2026-09-09`)
+    ).json();
+    const warm = (await (
+      await fetch(`${baseUrl}/api/setup/status`)
+    ).json()) as { cacheCoverage: Record<string, unknown> };
+
+    expect(warm.cacheCoverage).toMatchObject({
+      firstDate: "2026-09-01",
+      lastDate: "2026-09-09",
+      days: 7,
+      spans: [
+        { startDate: "2026-09-01", endDate: "2026-09-05" },
+        { startDate: "2026-09-08", endDate: "2026-09-09" },
+      ],
+    });
+  });
+
+  it("validates, saves, and reports the startup range", async () => {
+    const directory = await tempDirectory();
+    const baseUrl = await listen(
+      createApp({
+        setup: { allowed: true, configure: vi.fn() },
+        loadTeamMetadata: false,
+        startupRanges: new StartupRangeFile(join(directory, "range.json")),
+      }),
+    );
+
+    for (const invalid of [
+      { kind: "preset", days: 0 },
+      { kind: "preset", days: 367 },
+      { kind: "custom", startDate: "2026-09-10", endDate: "2026-09-01" },
+      { kind: "custom", startDate: "2025-01-01", endDate: "2026-09-01" },
+      { kind: "rolling", days: 30 },
+    ]) {
+      expect((await putRange(baseUrl, invalid)).status).toBe(400);
+    }
+
+    const saved = await putRange(baseUrl, {
+      kind: "custom",
+      startDate: "2026-06-01",
+      endDate: "2026-08-31",
+      extra: true,
+    });
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toEqual({
+      rangePreference: {
+        kind: "custom",
+        startDate: "2026-06-01",
+        endDate: "2026-08-31",
+      },
+    });
+
+    const status = (await (
+      await fetch(`${baseUrl}/api/setup/status`)
+    ).json()) as { rangePreference: unknown };
+    expect(status.rangePreference).toEqual({
+      kind: "custom",
+      startDate: "2026-06-01",
+      endDate: "2026-08-31",
+    });
+
+    const restarted = await new StartupRangeFile(
+      join(directory, "range.json"),
+    ).read();
+    expect(restarted).toEqual(status.rangePreference);
+  });
+
+  it("answers 503 when the startup range cannot be stored", async () => {
+    const unavailable = await listen(createApp({ loadTeamMetadata: false }));
+    expect(
+      (await putRange(unavailable, { kind: "preset", days: 30 })).status,
+    ).toBe(503);
+    server?.close();
+    server = undefined;
+
+    const failing = await listen(
+      createApp({
+        loadTeamMetadata: false,
+        startupRanges: {
+          read: async () => {
+            throw new Error("unreadable");
+          },
+          write: async () => {
+            throw new Error("read-only");
+          },
+        },
+      }),
+    );
+    expect((await putRange(failing, { kind: "preset", days: 30 })).status).toBe(
+      503,
+    );
+    const status = (await (
+      await fetch(`${failing}/api/setup/status`)
+    ).json()) as { rangePreference: unknown };
+    expect(status.rangePreference).toBeNull();
+  });
+});
+
 describe("dashboard setup endpoint", () => {
   it("rejects malformed and oversized JSON without logging key material", async () => {
     const secret = "key_do_not_log";
@@ -1326,6 +1587,8 @@ describe("dashboard setup endpoint", () => {
       configured: false,
       setupAllowed: false,
       defaultRangeDays: 14,
+      rangePreference: null,
+      cacheCoverage: null,
     });
   });
 
@@ -1347,6 +1610,8 @@ describe("dashboard setup endpoint", () => {
       configured: false,
       setupAllowed: true,
       defaultRangeDays: 90,
+      rangePreference: null,
+      cacheCoverage: null,
     });
 
     const blockedAnalytics = await fetch(
@@ -1370,6 +1635,8 @@ describe("dashboard setup endpoint", () => {
       configured: true,
       setupAllowed: true,
       defaultRangeDays: 90,
+      rangePreference: null,
+      cacheCoverage: null,
     });
 
     const analytics = await fetch(

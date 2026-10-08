@@ -44,7 +44,7 @@ export interface RuntimeSettings {
     maxBytes: number;
     refetchDays: number;
   };
-  /** Inclusive length of the range the dashboard loads first. */
+  /** Inclusive length of the range pre-selected at startup when none is remembered. */
   defaultRangeDays: number;
 }
 
