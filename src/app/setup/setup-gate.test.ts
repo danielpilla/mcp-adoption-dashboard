@@ -3,6 +3,7 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { inclusiveDayCount, presetRange } from "../dashboard/dashboard-dates";
 import { SetupGate } from "./setup-gate";
 
 (
@@ -22,9 +23,9 @@ async function render(element: ReactNode) {
   return container;
 }
 
-function setupStatusResponse() {
+function setupStatusResponse(extra: Record<string, unknown> = {}) {
   return new Response(
-    JSON.stringify({ configured: true, setupAllowed: true }),
+    JSON.stringify({ configured: true, setupAllowed: true, ...extra }),
     {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -158,4 +159,48 @@ describe("setup gate stream handling", () => {
     expect(container.textContent).toContain("Directory groups");
     expect(container.textContent).toContain("40%");
   });
+
+  it.each([
+    [{ defaultRangeDays: 14 }, 14],
+    [{ defaultRangeDays: 366 }, 366],
+    [{}, 90],
+    [{ defaultRangeDays: 0 }, 90],
+    [{ defaultRangeDays: 367 }, 90],
+    [{ defaultRangeDays: "14" }, 90],
+  ])(
+    "loads the initial range from setup status %j",
+    async (status, expectedDays) => {
+      const pendingStream = new ReadableStream<Uint8Array>();
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(setupStatusResponse(status))
+        .mockResolvedValueOnce(new Response(pendingStream, { status: 200 }));
+      vi.stubGlobal("fetch", fetcher);
+      const container = await render(
+        createElement(SetupGate, { initialData: null }),
+      );
+
+      await act(async () => {
+        await vi.waitFor(() =>
+          expect(container.querySelector("h1")?.textContent).toBe(
+            "Loading dashboard",
+          ),
+        );
+      });
+
+      expect(container.querySelector(".eyebrow")?.textContent).toBe(
+        `${expectedDays}-day view`,
+      );
+      const streamUrl = new URL(
+        String(fetcher.mock.calls[1]?.[0]),
+        "http://localhost",
+      );
+      const range = {
+        startDate: streamUrl.searchParams.get("startDate") ?? "",
+        endDate: streamUrl.searchParams.get("endDate") ?? "",
+      };
+      expect(range).toEqual(presetRange(expectedDays));
+      expect(inclusiveDayCount(range)).toBe(expectedDays);
+    },
+  );
 });

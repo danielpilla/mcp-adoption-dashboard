@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   formatIsoDate,
   inclusiveDayCount,
+  initialRangeDays,
   parseIsoDate,
+  presetRange,
   rangeLabel,
   shiftIsoDate,
 } from "./dashboard-dates";
@@ -36,4 +38,19 @@ describe("dashboard date helpers", () => {
       "Sep 1, 2026 – Sep 21, 2026",
     );
   });
+
+  it.each([1, 14, 90, 366])(
+    "uses a configured %i-day initial range",
+    (days) => {
+      expect(initialRangeDays(days)).toBe(days);
+      expect(inclusiveDayCount(presetRange(initialRangeDays(days)))).toBe(days);
+    },
+  );
+
+  it.each([undefined, null, 0, 367, -1, 14.5, Number.NaN, "14", {}])(
+    "uses the 90-day initial range for %j",
+    (value) => {
+      expect(initialRangeDays(value)).toBe(90);
+    },
+  );
 });
