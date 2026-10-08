@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CursorApiClient,
+  DEFAULT_CURSOR_API_LIMITS,
   enrichMcpResponse,
   retryDelayMilliseconds,
   type TeamMetadata,
@@ -453,9 +454,9 @@ describe("CursorApiClient", () => {
 
     expect(fetcher).toHaveBeenCalledTimes(3);
     const urls = fetcher.mock.calls.map(([url]) => String(url));
-    expect(urls[0]).toContain("startDate=2026-06-21&endDate=2026-07-20");
+    expect(urls[0]).toContain("startDate=2026-08-20&endDate=2026-09-18");
     expect(urls[1]).toContain("startDate=2026-07-21&endDate=2026-08-19");
-    expect(urls[2]).toContain("startDate=2026-08-20&endDate=2026-09-18");
+    expect(urls[2]).toContain("startDate=2026-06-21&endDate=2026-07-20");
     expect(onProgress.mock.calls.map(([progress]) => progress)).toEqual([
       { completedWindows: 0, totalWindows: 3 },
       { completedWindows: 1, totalWindows: 3 },
@@ -500,7 +501,7 @@ describe("CursorApiClient", () => {
         await firstWaveStarted.promise;
 
         const url = new URL(String(input));
-        if (url.searchParams.get("startDate") === "2026-01-01") {
+        if (url.searchParams.get("startDate") === "2026-05-31") {
           return new Response("invalid upstream window", { status: 400 });
         }
 
@@ -528,7 +529,7 @@ describe("CursorApiClient", () => {
     expect(fetcher).toHaveBeenCalledTimes(4);
     expect(
       fetcher.mock.calls
-        .filter(([input]) => !String(input).includes("startDate=2026-01-01"))
+        .filter(([input]) => !String(input).includes("startDate=2026-05-31"))
         .every(([, init]) => init?.signal?.aborted),
     ).toBe(true);
   });
@@ -604,6 +605,7 @@ describe("CursorApiClient", () => {
       undefined,
       controller.signal,
     );
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
     controller.abort();
 
     await expect(request).rejects.toMatchObject({ name: "AbortError" });
@@ -685,25 +687,35 @@ describe("CursorApiClient", () => {
     });
   });
 
-  it("rejects oversized upstream responses before buffering them", async () => {
+  it("stops at an oversized page without buffering it and returns a partial result", async () => {
+    const cancel = vi.fn();
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", {
+      new Response(new ReadableStream({ cancel }), {
         status: 200,
-        headers: { "content-length": String(11 * 1024 * 1024) },
+        headers: { "content-length": String(2_048) },
       }),
     );
     const client = new CursorApiClient(
       "test-key",
       "https://example.test",
       fetcher,
+      undefined,
+      "",
+      undefined,
+      { maxPageBytes: 1_024 },
     );
 
-    await expect(
-      client.fetchMcp("2026-09-01", "2026-09-10"),
-    ).rejects.toMatchObject({
-      status: 502,
-      message: "Cursor API response exceeded the size limit",
-    });
+    const result = await client.fetchMcp("2026-09-01", "2026-09-10");
+
+    expect(cancel).toHaveBeenCalled();
+    expect(result.records).toEqual([]);
+    expect(result.notices).toEqual([
+      expect.objectContaining({
+        code: "LIMIT_REACHED",
+        setting: "MAX_API_PAGE_BYTES",
+        limit: 1_024,
+      }),
+    ]);
   });
 
   it("rejects incomplete successful analytics payloads", async () => {
@@ -762,12 +774,23 @@ describe("CursorApiClient", () => {
       2,
     );
 
-    await expect(
-      client.fetchMcp("2026-06-21", "2026-09-18"),
-    ).rejects.toMatchObject({ status: 502 });
+    const result = await client.fetchMcp("2026-06-21", "2026-09-18");
+
+    expect(result.records.map((record) => record.date)).toEqual([
+      "2026-07-21",
+      "2026-08-20",
+    ]);
+    expect(result.notices).toEqual([
+      expect.objectContaining({
+        code: "LIMIT_REACHED",
+        setting: "MAX_MCP_RECORDS",
+        limit: 2,
+        completeFrom: "2026-07-21",
+      }),
+    ]);
   });
 
-  it("rejects analytics above the configured response byte limit", async () => {
+  it("returns partial analytics at the configured response byte limit", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse({
         data: {
@@ -793,15 +816,20 @@ describe("CursorApiClient", () => {
       { maxResponseBytes: 1 },
     );
 
-    await expect(
-      client.fetchMcp("2026-09-01", "2026-09-01"),
-    ).rejects.toMatchObject({
-      status: 502,
-      message: expect.stringContaining("response-size safety limit"),
-    });
+    const result = await client.fetchMcp("2026-09-01", "2026-09-01");
+
+    expect(result.records).toEqual([]);
+    expect(result.notices).toEqual([
+      expect.objectContaining({
+        setting: "MAX_MCP_RESPONSE_BYTES",
+        limit: 1,
+        message: expect.stringContaining("No day in this range is complete."),
+      }),
+    ]);
+    expect(result.notices?.[0]).not.toHaveProperty("completeFrom");
   });
 
-  it("bounds directory groups and group memberships", async () => {
+  it("keeps loaded directory data when a directory cap is reached", async () => {
     const groupsFetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -828,10 +856,15 @@ describe("CursorApiClient", () => {
       { maxDirectoryGroups: 1 },
     );
 
-    await expect(groupsClient.fetchTeamMetadata()).rejects.toMatchObject({
-      status: 502,
-      message: expect.stringContaining("directory groups"),
-    });
+    const groups = await groupsClient.fetchTeamMetadata();
+    expect(groups.groupNames).toEqual(["One"]);
+    expect(groups.notices).toEqual([
+      expect.objectContaining({
+        code: "LIMIT_REACHED",
+        setting: "MAX_DIRECTORY_GROUPS",
+        limit: 1,
+      }),
+    ]);
 
     const membershipsFetcher = vi
       .fn<typeof fetch>()
@@ -873,64 +906,19 @@ describe("CursorApiClient", () => {
       { maxGroupMemberships: 1 },
     );
 
-    await expect(membershipsClient.fetchTeamMetadata()).rejects.toMatchObject({
-      status: 502,
-      message: expect.stringContaining("group memberships"),
-    });
-  });
-
-  it("bounds group assignments added during enrichment", () => {
-    const response: McpResponse = {
-      records: [
-        {
-          date: "2026-09-01",
-          userId: "user-1",
-          email: "user@example.test",
-          displayName: "User",
-          server: "github",
-          tool: "search",
-          usage: 1,
-        },
-      ],
-      summary: {
-        totalUsage: 1,
-        uniqueUsers: 1,
-        uniqueServers: 1,
-        uniqueTools: 1,
-      },
-      range: {
-        startDate: "2026-09-01",
-        endDate: "2026-09-01",
-      },
-      generatedAt: "2026-09-01T12:00:00.000Z",
-      source: "live",
-    };
-    const metadata: TeamMetadata = {
-      users: new Map([
-        [
-          "user@example.test",
-          {
-            name: "User",
-            role: "member",
-            directoryGroups: ["One", "Two"],
-          },
-        ],
-      ]),
-      memberCount: 1,
-      groupNames: ["One", "Two"],
-    };
-
-    expect(() => enrichMcpResponse(response, metadata, "", 1)).toThrow(
-      "Enriched group assignments exceed the configured safety limit",
+    const memberships = await membershipsClient.fetchTeamMetadata();
+    expect(memberships.users.get("one@example.test")?.directoryGroups).toEqual([
+      "Engineering",
+    ]);
+    expect(memberships.users.get("two@example.test")?.directoryGroups).toEqual(
+      [],
     );
-
-    const enriched = enrichMcpResponse(response, metadata, "", 2);
-    expect(enriched).not.toBe(response);
-    expect(enriched.records[0]).toMatchObject({
-      role: "member",
-      directoryGroups: ["One", "Two"],
-    });
-    expect(response.records[0]).not.toHaveProperty("role");
+    expect(memberships.notices).toEqual([
+      expect.objectContaining({
+        setting: "MAX_GROUP_MEMBERSHIPS",
+        limit: 1,
+      }),
+    ]);
   });
 
   it("continues pagination when valid pages contain only zero usage", async () => {
@@ -999,11 +987,12 @@ describe("CursorApiClient", () => {
       2,
     );
 
-    await expect(
-      client.fetchMcp("2026-09-01", "2026-09-10"),
-    ).rejects.toMatchObject({
-      status: 502,
-      message: expect.stringContaining("2-record safety limit"),
+    const result = await client.fetchMcp("2026-09-01", "2026-09-10");
+
+    expect(result.records).toEqual([]);
+    expect(result.notices?.[0]).toMatchObject({
+      setting: "MAX_MCP_RECORDS",
+      message: expect.stringContaining("2-record limit"),
     });
   });
 
@@ -1041,6 +1030,7 @@ describe("CursorApiClient", () => {
     const result = await client.fetchMcp("2026-09-01", "2026-09-10");
 
     expect(result.records).toEqual([]);
+    expect(result).not.toHaveProperty("notices");
   });
 
   it("shares the zero-usage processing budget across pages", async () => {
@@ -1069,12 +1059,10 @@ describe("CursorApiClient", () => {
       2,
     );
 
-    await expect(
-      client.fetchMcp("2026-09-01", "2026-09-10"),
-    ).rejects.toMatchObject({
-      status: 502,
-      message: expect.stringContaining("2-record safety limit"),
-    });
+    const result = await client.fetchMcp("2026-09-01", "2026-09-10");
+
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(result.notices?.[0]).toMatchObject({ setting: "MAX_MCP_RECORDS" });
   });
 
   it("rejects duplicate aggregate rows instead of double-counting", async () => {
@@ -1115,5 +1103,286 @@ describe("CursorApiClient", () => {
       client.fetchMcp("2026-09-01", "2026-09-10"),
     ).rejects.toMatchObject({ status: 403 });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("defaults every cap high enough for 100 million records", () => {
+    expect(DEFAULT_CURSOR_API_LIMITS).toEqual({
+      maxRecords: 100_000_000,
+      maxResponseBytes: 25_600_000_000,
+      maxPageBytes: 64 * 1024 * 1024,
+      maxDirectoryGroups: 1_000_000,
+      maxGroupMemberships: 100_000_000,
+      maxEnrichedGroupAssignments: 1_000_000_000,
+    });
+  });
+
+  it("validates a key with one single-row analytics request", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({
+        data: {},
+        pagination: { hasNextPage: true },
+        params: { teamId: 42 },
+      }),
+    );
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+    );
+
+    await expect(client.validateApiKey()).resolves.toEqual({ teamId: "42" });
+
+    expect(fetcher).toHaveBeenCalledOnce();
+    const url = new URL(String(fetcher.mock.calls[0][0]));
+    expect(url.pathname).toBe("/analytics/by-user/mcp");
+    expect(url.searchParams.get("pageSize")).toBe("1");
+    expect(url.searchParams.get("page")).toBe("1");
+  });
+
+  it("keeps the newest windows complete when older windows answer first", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      const startDate = url.searchParams.get("startDate") ?? "";
+      const endDate = url.searchParams.get("endDate") ?? "";
+      // The newest window answers last so older windows reach the cap first.
+      if (endDate === "2026-09-18") {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return jsonResponse({
+        data: {
+          "user-1@example.com": [startDate, endDate].map((date, index) => ({
+            event_date: date,
+            tool_name: `tool-${index}`,
+            mcp_server_name: "server-1",
+            usage: 1,
+          })),
+        },
+        pagination: { hasNextPage: false },
+      });
+    });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+      undefined,
+      "",
+      3,
+    );
+
+    const result = await client.fetchMcp("2026-06-21", "2026-09-18");
+
+    expect(result.records.map((record) => record.date)).toEqual([
+      "2026-08-19",
+      "2026-08-20",
+      "2026-09-18",
+    ]);
+    expect(result.notices).toEqual([
+      expect.objectContaining({
+        setting: "MAX_MCP_RECORDS",
+        completeFrom: "2026-08-20",
+        message: expect.stringContaining(
+          "Activity from 2026-08-20 through 2026-09-18 is complete",
+        ),
+      }),
+    ]);
+  });
+
+  it("returns what was loaded when the analytics deadline passes", async () => {
+    const deadline = new AbortController();
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input, init) => {
+        const url = new URL(String(input));
+        if (url.searchParams.get("endDate") === "2026-09-18") {
+          return jsonResponse({
+            data: {
+              "user-1@example.com": [
+                {
+                  event_date: "2026-09-18",
+                  tool_name: "search",
+                  mcp_server_name: "server-1",
+                  usage: 2,
+                },
+              ],
+            },
+            pagination: { hasNextPage: false },
+          });
+        }
+        queueMicrotask(() => deadline.abort());
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(init.signal?.reason),
+            { once: true },
+          );
+        });
+      });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+    );
+
+    const dataset = await client.fetchMcpDataset("2026-07-21", "2026-09-18", {
+      deadline: deadline.signal,
+      deadlineMs: 5_000,
+    });
+
+    const days = [];
+    for await (const day of dataset.readDays("ascending")) days.push(day);
+    expect(days.map((day) => day.date)).toEqual(["2026-09-18"]);
+    expect(dataset.notices).toEqual([
+      expect.objectContaining({
+        setting: "ANALYTICS_TIMEOUT_MS",
+        limit: 5_000,
+        completeFrom: "2026-08-20",
+      }),
+    ]);
+  });
+
+  it("returns loaded directory groups when the directory deadline passes", async () => {
+    const deadline = new AbortController();
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url.includes("/teams/members")) {
+          return jsonResponse({
+            teamMembers: [{ id: "user-1", email: "user-1@example.com" }],
+          });
+        }
+        if (url.includes("/directory-groups/group-1/members")) {
+          return jsonResponse({
+            members: [{ userId: "user-1" }],
+            pagination: { hasNextPage: false },
+          });
+        }
+        if (url.includes("/directory-groups/group-2/members")) {
+          queueMicrotask(() => deadline.abort());
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(init.signal?.reason),
+              { once: true },
+            );
+          });
+        }
+        return jsonResponse({
+          groups: [
+            { id: "group-1", name: "group-1" },
+            { id: "group-2", name: "group-2" },
+          ],
+          pagination: { hasNextPage: false },
+        });
+      });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+    );
+
+    const metadata = await client.fetchTeamMetadata(
+      undefined,
+      undefined,
+      deadline.signal,
+      60_000,
+    );
+
+    expect(metadata.users.get("user-1@example.com")?.directoryGroups).toEqual([
+      "group-1",
+    ]);
+    expect(metadata.notices).toEqual([
+      expect.objectContaining({
+        setting: "DIRECTORY_LOAD_TIMEOUT_MS",
+        limit: 60_000,
+      }),
+    ]);
+  });
+
+  it("rejects duplicate rows that span pages", async () => {
+    const metric = {
+      event_date: "2026-09-01",
+      tool_name: "search",
+      mcp_server_name: "server-1",
+      usage: 3,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const page = Number(new URL(String(input)).searchParams.get("page"));
+      return jsonResponse({
+        data: {
+          "user-1@example.com": [
+            metric,
+            { ...metric, tool_name: `tool-${page}` },
+          ],
+        },
+        pagination: { hasNextPage: page < 2 },
+      });
+    });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+    );
+
+    await expect(
+      client.fetchMcp("2026-09-01", "2026-09-10"),
+    ).rejects.toMatchObject({
+      status: 502,
+      message: "Cursor API returned a duplicate MCP metric",
+    });
+  });
+
+  it("bounds group assignments added during enrichment", () => {
+    const response: McpResponse = {
+      records: [
+        {
+          date: "2026-09-01",
+          userId: "user-1",
+          email: "user@example.test",
+          displayName: "User",
+          server: "github",
+          tool: "search",
+          usage: 1,
+        },
+      ],
+      summary: {
+        totalUsage: 1,
+        uniqueUsers: 1,
+        uniqueServers: 1,
+        uniqueTools: 1,
+      },
+      range: {
+        startDate: "2026-09-01",
+        endDate: "2026-09-01",
+      },
+      generatedAt: "2026-09-01T12:00:00.000Z",
+      source: "live",
+    };
+    const metadata: TeamMetadata = {
+      users: new Map([
+        [
+          "user@example.test",
+          {
+            name: "User",
+            role: "member",
+            directoryGroups: ["One", "Two"],
+          },
+        ],
+      ]),
+      memberCount: 1,
+      groupNames: ["One", "Two"],
+    };
+
+    expect(() => enrichMcpResponse(response, metadata, "", 1)).toThrow(
+      "Enriched group assignments exceed the configured safety limit",
+    );
+
+    const enriched = enrichMcpResponse(response, metadata, "", 2);
+    expect(enriched).not.toBe(response);
+    expect(enriched.records[0]).toMatchObject({
+      role: "member",
+      directoryGroups: ["One", "Two"],
+    });
+    expect(response.records[0]).not.toHaveProperty("role");
   });
 });
