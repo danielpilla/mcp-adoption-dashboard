@@ -411,8 +411,13 @@ function safeJson(value: unknown): string {
 }
 
 function serializeSnapshot(payload: SnapshotPayload): string {
+  // A snapshot never reloads, so a pending directory load does not apply.
+  const notices = payload.notices?.filter(
+    (notice) => notice.code !== "DIRECTORY_LOADING",
+  );
   return safeJson({
     ...payload,
+    notices: notices && notices.length > 0 ? notices : undefined,
     source: "snapshot",
     snapshotScope: scopeProvenance(payload),
   });

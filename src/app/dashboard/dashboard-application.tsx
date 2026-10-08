@@ -1,4 +1,11 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   summarizeMcpRecords,
   type McpResponse,
@@ -13,6 +20,7 @@ import type { Filters } from "../scope/filter-model";
 import { DashboardScopeBar } from "../scope/dashboard-scope-bar";
 import { DashboardAnalysis } from "./dashboard-analysis";
 import { DashboardHeader } from "./dashboard-header";
+import { DashboardNotices } from "./dashboard-notices";
 import { DashboardOverview, type DashboardKpiView } from "./dashboard-overview";
 import { DashboardPhaseHeader } from "./dashboard-phase-header";
 import { DrawerScopePanel } from "../scope/drawer-scope-panel";
@@ -32,6 +40,7 @@ import {
   rangeLabel,
 } from "./dashboard-dates";
 import { useDashboardData } from "./use-dashboard-data";
+import { useDirectoryStatus } from "./use-directory-status";
 import { useDashboardExports } from "../exports/use-dashboard-exports";
 import { useDashboardPhaseNavigation } from "./use-dashboard-phase-navigation";
 import { useDashboardSelections } from "../scope/use-dashboard-selections";
@@ -125,7 +134,13 @@ export function App({
       activeRange,
       draftRange,
     },
-    actions: { updateRange, drillToRange, refreshData, retryFailedLoad },
+    actions: {
+      loadData,
+      updateRange,
+      drillToRange,
+      refreshData,
+      retryFailedLoad,
+    },
   } = useDashboardData({
     initialData,
     initialRange,
@@ -133,6 +148,26 @@ export function App({
     onBeforeRangeChange: cancelPendingSelections,
   });
   const isSnapshot = initialData?.source === "snapshot";
+  const notices = data?.notices ?? [];
+  const directoryLoading =
+    !isSnapshot &&
+    notices.some((notice) => notice.code === "DIRECTORY_LOADING");
+  const loadedRange = data?.range;
+  const reloadWithDirectory = useCallback(() => {
+    if (loadedRange) {
+      void loadData(loadedRange, { preserveActiveRange: true });
+    }
+  }, [loadData, loadedRange]);
+  const directoryProgress = useDirectoryStatus(
+    directoryLoading,
+    reloadWithDirectory,
+  );
+  const showCompleteDays = useCallback(
+    (startDate: string) => {
+      drillToRange({ startDate, endDate: activeRange.endDate });
+    },
+    [activeRange.endDate, drillToRange],
+  );
   const { activePhase, scopeBarStuck, selectionBarRef, selectPhase } =
     useDashboardPhaseNavigation(Boolean(data));
 
@@ -616,6 +651,13 @@ export function App({
             </button>
           </section>
         )}
+
+        <DashboardNotices
+          notices={notices}
+          directory={directoryProgress}
+          activeRange={activeRange}
+          onShowFrom={showCompleteDays}
+        />
 
         {busy && !data ? (
           <section className="loading-dashboard">
