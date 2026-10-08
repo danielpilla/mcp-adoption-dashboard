@@ -64,10 +64,45 @@ export interface TeamMetadata {
   notices?: McpResponseNotice[];
 }
 
+/** Why a request is waiting to be retried. */
+type RetryReason = "rate_limited" | "server_error" | "network_error";
+
+export interface RetryNotice {
+  /** The attempt that runs after the wait, starting at 2. */
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  reason: RetryReason;
+  /** Upstream HTTP status, when the retry follows a response. */
+  status?: number;
+}
+
+/** A fetch window that is being requested. */
+interface ActiveWindowProgress {
+  startDate: string;
+  endDate: string;
+  days: number;
+  pagesLoaded: number;
+  /** Null until the upstream reports a page count. */
+  totalPages: number | null;
+}
+
 export interface McpFetchProgress {
   completedWindows: number;
   totalWindows: number;
   cachedDays?: number;
+  /** Days in the requested range. */
+  totalDays?: number;
+  /** Days in fetch windows that finished. */
+  fetchedDays?: number;
+  /** Activity rows loaded so far, from the cache and from Cursor. */
+  records?: number;
+  /** Windows being fetched, newest first. */
+  activeWindows?: ActiveWindowProgress[];
+  /** Present while a request waits to be retried. */
+  retry?: RetryNotice & { startedAt: number };
+  /** Epoch milliseconds of the last page or window that finished. */
+  lastActivityAt?: number;
 }
 
 export interface McpDatasetOptions {
@@ -115,6 +150,10 @@ interface WindowHooks {
   allowance(): { records: number; bytes: number };
   consume(records: number, bytes: number): void;
   write(records: McpRecord[]): Promise<void>;
+  /** Called after each page with the upstream page count, when known. */
+  page?(pagesLoaded: number, totalPages: number | undefined): void;
+  /** Called before a failed request is retried. */
+  retry?(notice: RetryNotice): void;
 }
 
 export interface CursorApiLimits {
@@ -428,6 +467,7 @@ export class CursorApiClient {
   private async requestJson(
     path: string,
     signal?: AbortSignal,
+    onRetry?: (notice: RetryNotice) => void,
   ): Promise<unknown> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       signal?.throwIfAborted();
@@ -449,7 +489,14 @@ export class CursorApiClient {
       } catch (error) {
         signal?.throwIfAborted();
         if (attempt < MAX_ATTEMPTS - 1) {
-          await this.wait(2 ** attempt * 250, signal);
+          const delayMs = 2 ** attempt * 250;
+          onRetry?.({
+            attempt: attempt + 2,
+            maxAttempts: MAX_ATTEMPTS,
+            delayMs,
+            reason: "network_error",
+          });
+          await this.wait(delayMs, signal);
           signal?.throwIfAborted();
           continue;
         }
@@ -480,13 +527,18 @@ export class CursorApiClient {
         if (response.body) {
           await response.body.cancel().catch(() => undefined);
         }
-        await this.wait(
-          retryDelayMilliseconds(
-            response.headers.get("retry-after"),
-            2 ** attempt * 500,
-          ),
-          signal,
+        const delayMs = retryDelayMilliseconds(
+          response.headers.get("retry-after"),
+          2 ** attempt * 500,
         );
+        onRetry?.({
+          attempt: attempt + 2,
+          maxAttempts: MAX_ATTEMPTS,
+          delayMs,
+          reason: response.status === 429 ? "rate_limited" : "server_error",
+          status: response.status,
+        });
+        await this.wait(delayMs, signal);
         signal?.throwIfAborted();
         continue;
       }
@@ -748,7 +800,11 @@ export class CursorApiClient {
         pageSize: String(PAGE_SIZE),
       });
       const payload = requireObject(
-        await this.requestJson(`/analytics/by-user/mcp?${query}`, signal),
+        await this.requestJson(
+          `/analytics/by-user/mcp?${query}`,
+          signal,
+          hooks.retry,
+        ),
         "MCP analytics",
       );
       const data = requireObject(payload.data, "MCP analytics data");
@@ -888,6 +944,7 @@ export class CursorApiClient {
 
       hooks.consume(usedRecords, usedBytes);
       await hooks.write(records);
+      hooks.page?.(page, pagination.totalPages);
       if (outcome !== "complete") return outcome;
 
       const nextCount = nextNoProgressCount(
@@ -937,12 +994,44 @@ export class CursorApiClient {
     );
     const totalWindows = fetchIndexes.length;
     let completedWindows = 0;
-    const report = () =>
+    const totalDays = segments.reduce(
+      (total, segment) => total + segment.dates.length,
+      0,
+    );
+    let fetchedDays = 0;
+    let records = segments.reduce(
+      (total, segment) =>
+        total + (segment.kind === "cached" ? segment.processed : 0),
+      0,
+    );
+    let lastActivityAt = Date.now();
+    const active = new Map<
+      number,
+      ActiveWindowProgress & { retry?: McpFetchProgress["retry"] }
+    >();
+    const report = () => {
+      const windows = [...active]
+        .sort(([a], [b]) => a - b)
+        .map(([, window]) => window);
+      const retry = windows.find((window) => window.retry)?.retry;
       onProgress?.({
         completedWindows,
         totalWindows,
         ...(cachedDays > 0 ? { cachedDays } : {}),
+        totalDays,
+        fetchedDays,
+        records,
+        activeWindows: windows.map((window) => ({
+          startDate: window.startDate,
+          endDate: window.endDate,
+          days: window.days,
+          pagesLoaded: window.pagesLoaded,
+          totalPages: window.totalPages,
+        })),
+        ...(retry ? { retry } : {}),
+        lastActivityAt,
       });
+    };
     report();
     if (totalWindows === 0) return;
 
@@ -1004,6 +1093,17 @@ export class CursorApiClient {
           ...(deadline ? [deadline] : []),
         ]);
         segment.status = "running";
+        const progress: ActiveWindowProgress & {
+          retry?: McpFetchProgress["retry"];
+        } = {
+          startDate: segment.startDate,
+          endDate: segment.endDate,
+          days: segment.dates.length,
+          pagesLoaded: 0,
+          totalPages: null,
+        };
+        active.set(index, progress);
+        report();
         try {
           const outcome = await this.fetchMcpWindow(
             segment.startDate,
@@ -1028,18 +1128,34 @@ export class CursorApiClient {
                 segment.processed += records;
                 segment.bytes += bytes;
               },
-              write: (records) => run.write(records),
+              write: (rows) => {
+                records += rows.length;
+                return run.write(rows);
+              },
+              page: (pagesLoaded, totalPages) => {
+                progress.pagesLoaded = pagesLoaded;
+                progress.totalPages = totalPages ?? null;
+                delete progress.retry;
+                lastActivityAt = Date.now();
+                report();
+              },
+              retry: (notice) => {
+                progress.retry = { ...notice, startedAt: Date.now() };
+                report();
+              },
             },
             windowSignal,
           );
           if (outcome === "complete") {
             segment.days = await run.sealWindow(segment.dates, true);
             segment.status = "complete";
+            fetchedDays += segment.dates.length;
           } else if (index > boundary) {
             segment.status = "abandoned";
           } else {
             truncate(index, outcome);
             segment.days = await run.sealWindow(segment.dates, false);
+            fetchedDays += segment.dates.length;
           }
         } catch (error) {
           if (signal?.aborted || failed) return;
@@ -1059,8 +1175,10 @@ export class CursorApiClient {
           }
         } finally {
           controllers.delete(index);
+          active.delete(index);
         }
         completedWindows += 1;
+        lastActivityAt = Date.now();
         report();
       }
     };
