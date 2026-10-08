@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { classifyMcpServer, configureInternalMcpServers } from "./mcp-origin";
-import { parseMcpResponse } from "./mcp-response";
+import {
+  McpSummaryAccumulator,
+  parseMcpResponse,
+  summarizeMcpRecords,
+} from "./mcp-response";
 
 const response = {
   records: [
@@ -159,5 +163,67 @@ describe("dashboard response validation", () => {
 
     expect(classifyMcpServer("configured-internal")).toBe("internal");
     expect(classifyMcpServer("payload-internal")).toBe("external");
+  });
+
+  it("keeps valid notices and drops an empty notice list", () => {
+    const notice = {
+      code: "LIMIT_REACHED",
+      message: "Showing partial activity.",
+      setting: "MAX_MCP_RECORDS",
+      limit: 10,
+      completeFrom: "2026-09-20",
+      extra: "ignored",
+    };
+
+    expect(
+      parseMcpResponse({ ...response, notices: [notice] }).notices,
+    ).toEqual([
+      {
+        code: "LIMIT_REACHED",
+        message: "Showing partial activity.",
+        setting: "MAX_MCP_RECORDS",
+        limit: 10,
+        completeFrom: "2026-09-20",
+      },
+    ]);
+    expect(parseMcpResponse({ ...response, notices: [] })).not.toHaveProperty(
+      "notices",
+    );
+  });
+
+  it.each([
+    { code: "UNKNOWN", message: "x" },
+    { code: "LIMIT_REACHED", message: "x", setting: "lower_case" },
+    { code: "LIMIT_REACHED", message: "x", completeFrom: "2026-02-30" },
+    { code: "LIMIT_REACHED", message: "x", limit: -1 },
+    { code: "LIMIT_REACHED", message: "x".repeat(1_001) },
+  ])("rejects a malformed notice %#", (notice) => {
+    expect(() => parseMcpResponse({ ...response, notices: [notice] })).toThrow(
+      "a notice is malformed",
+    );
+  });
+
+  it("summarizes incrementally like the batch summary", () => {
+    const records = [
+      response.records[0],
+      {
+        ...response.records[0],
+        userId: "user-2",
+        email: "user-2@example.com",
+        tool: "fetch",
+        usage: 2,
+      },
+      { ...response.records[0], server: "other", usage: 1 },
+    ];
+    const accumulator = new McpSummaryAccumulator();
+    for (const record of records) accumulator.add(record);
+
+    expect(accumulator.result()).toEqual(summarizeMcpRecords(records));
+    expect(accumulator.result()).toEqual({
+      totalUsage: 6,
+      uniqueUsers: 2,
+      uniqueServers: 2,
+      uniqueTools: 3,
+    });
   });
 });
