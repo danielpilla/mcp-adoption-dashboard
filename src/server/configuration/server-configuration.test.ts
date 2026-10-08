@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertNetworkBindingAllowed,
   isLoopbackHost,
+  parseNonNegativeInteger,
   parsePort,
   parsePortValue,
   parsePositiveInteger,
@@ -43,6 +44,17 @@ describe("server configuration", () => {
     for (const invalid of ["0", "-1", "1.5", "not-a-number"]) {
       expect(() => parsePositiveInteger(invalid, 100, "LIMIT")).toThrow(
         "LIMIT must be a positive safe integer.",
+      );
+    }
+  });
+
+  it("parses non-negative settings", () => {
+    expect(parseNonNegativeInteger(undefined, 2, "DAYS")).toBe(2);
+    expect(parseNonNegativeInteger(" 0 ", 2, "DAYS")).toBe(0);
+    expect(parseNonNegativeInteger("7", 2, "DAYS")).toBe(7);
+    for (const invalid of ["-1", "1.5", "not-a-number", "9007199254740992"]) {
+      expect(() => parseNonNegativeInteger(invalid, 2, "DAYS")).toThrow(
+        "DAYS must be a non-negative safe integer.",
       );
     }
   });

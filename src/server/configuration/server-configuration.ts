@@ -39,6 +39,20 @@ export function parsePositiveInteger(
   return parsed;
 }
 
+export function parseNonNegativeInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+): number {
+  const raw = value?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a non-negative safe integer.`);
+  }
+  return parsed;
+}
+
 export function isLoopbackHost(host: string): boolean {
   const normalized = host
     .trim()
