@@ -25,3 +25,5 @@ test-results
 *.xlsx
 mcp-*.json
 mcp-*.html
+
+.cache
