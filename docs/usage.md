@@ -1,21 +1,61 @@
 # Dashboard usage
 
+## Startup range
+
+Before the first load, the dashboard asks for a starting range: a 7, 30, 90,
+180, or 365-day preset, or a custom UTC start and end date. Custom ranges are
+inclusive, cannot end in the future, and are limited to 366 days; an invalid
+range shows why and cannot be loaded. Each preset shows how much of it the
+per-day cache already holds: **Cached**, a partial meter, or the relative
+first-load effort. Longer ranges take longer the first time; cached days load
+without another request.
+
+The largest fully cached preset is pre-selected. When nothing is cached, the
+last `DEFAULT_RANGE_DAYS` days (default 90) are pre-selected; a value that is
+not a preset stays a rolling range of that length.
+
+The chosen range is remembered on the server in `startup-range.json` inside
+`MCP_CACHE_DIR`, and in the browser when the server cannot store it. On the
+next start, a remembered range that already has cached days loads at once. If
+none of its days are cached, the picker opens with that range selected and
+marked **Last used**. **Change range** on the loading screen stops the current
+load and reopens the picker. Deleting `MCP_CACHE_DIR` forgets the remembered
+range; changing the API key does not.
+
+## Loading progress
+
+The loading screen reports, for MCP activity:
+
+- days loaded out of the range, split into days from the cache and days
+  fetched from Cursor
+- the 30-day window being fetched, its page, and how many other windows are
+  running in parallel
+- activity rows loaded so far
+- elapsed time and an estimate of the time remaining, from the rate observed
+  so far
+- a retry notice with a countdown, the reason, and the attempt number while
+  Cursor asks for a pause or a request is retried
+- a slow notice when no new page has arrived for 15 seconds, and a quiet
+  notice when the local server has not answered for 8 seconds
+
+The same progress appears in a non-blocking notice above the dashboard while a
+range change or **Refresh** reloads data in the background.
+
 ## Navigation and scope
 
 The dashboard is organized into Dashboard, Analysis, and Reporting views. The
 scope bar preserves filters while moving between views and provides the single
 **Clear selections** action.
 
-The initial range is the last `DEFAULT_RANGE_DAYS` days (default 90). A
-value other than 7, 30, or 90 is shown as a custom range. Choose a preset or
-valid custom UTC range to reload data. **Refresh** bypasses the 12-hour server cache while preserving
-the current date drill-down and associative selections. Refreshes for the same
-range are limited to once every 10 seconds.
+Choose a preset or valid custom UTC range in the header to reload data.
+**Refresh** bypasses the 12-hour server cache while preserving the current date
+drill-down and associative selections. Refreshes for the same range are limited
+to once every 10 seconds.
 
-The loading screen shows activity progress and, separately, the background
-directory load. The dashboard opens as soon as activity is loaded; while the
-directory is still loading, a notice shows its progress and names, roles, and
-group filters appear automatically when it finishes.
+The loading screen also shows the background directory load. The dashboard
+opens as soon as activity is loaded; while the directory is still loading, a
+notice shows its progress and names, roles, and group filters appear
+automatically when it finishes.
 
 If a cap or timeout is reached, the dashboard shows the data loaded so far,
 newest days first, with a notice that names the setting to raise. When some
