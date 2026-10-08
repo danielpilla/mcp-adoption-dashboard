@@ -4,18 +4,40 @@ import express, {
   type Response,
 } from "express";
 import path from "node:path";
-import type { McpResponse } from "../../contracts/mcp-response.js";
+import type {
+  McpResponse,
+  McpResponseNotice,
+} from "../../contracts/mcp-response.js";
 import {
   CursorApiClient,
   CursorApiError,
-  DEFAULT_CURSOR_API_LIMITS,
-  enrichMcpResponse,
+  type McpFetchProgress,
   type TeamMetadata,
-  type TeamMetadataProgress,
 } from "../cursor/cursor-api.js";
+import {
+  createMemoryDataset,
+  formatCount,
+  type McpDataset,
+  type McpRunFactory,
+} from "../cursor/mcp-collection.js";
 import { isLoopbackHost } from "../configuration/server-configuration.js";
+import { DEFAULT_RUNTIME_SETTINGS } from "../configuration/runtime-settings.js";
 import { validateDateRange } from "../analytics/analytics-date-range.js";
-import { TeamMetadataCache } from "../cursor/team-metadata-cache.js";
+import {
+  TeamMetadataCache,
+  type DirectorySnapshot,
+} from "../cursor/team-metadata-cache.js";
+import {
+  writeJsonResponse,
+  writeNdjsonResponse,
+  type ChunkWriter,
+  type ResponseContext,
+} from "./mcp-response-writer.js";
+
+/** Disk-backed activity storage bound to the active API key. */
+interface ActivityStore extends McpRunFactory {
+  activate(apiKey: string): Promise<void>;
+}
 
 interface AppOptions {
   client?: CursorApiClient;
@@ -43,30 +65,27 @@ interface AppOptions {
   maxEnrichedGroupAssignments?: number;
   maxConcurrentAnalytics?: number;
   analyticsTimeoutMs?: number;
+  directoryTimeoutMs?: number;
+  /** How long a finished analytics request waits for a loading directory. */
+  directoryGraceMs?: number;
+  activityStore?: ActivityStore;
   loopbackOnly?: boolean;
   shutdownSignal?: AbortSignal;
 }
 
-interface CacheEntry<T> {
+interface AnalyticsCacheEntry {
   expiresAt: number;
-  value: Promise<T>;
-}
-
-interface AnalyticsCacheEntry extends CacheEntry<McpResponse> {
+  value: Promise<McpDataset>;
   controller?: AbortController;
-  metadataProgress?: TeamMetadataProgress;
-  progress: { completedWindows: number; totalWindows: number };
-  progressEvents: Array<
-    | {
-        kind: "analytics";
-        progress: { completedWindows: number; totalWindows: number };
-      }
-    | { kind: "metadata"; progress: TeamMetadataProgress }
-  >;
+  progress: McpFetchProgress;
+  progressEvents: McpFetchProgress[];
   progressListeners: Set<() => void>;
   recordCount: number;
   settled: boolean;
   subscribers: number;
+  /** Readers plus the cache itself; storage is released when this reaches 0. */
+  holders: number;
+  releaseCacheHold?: () => void;
 }
 
 interface ClientSnapshot {
@@ -82,10 +101,9 @@ class AnalyticsCapacityError extends Error {
 }
 
 const DEFAULT_CACHE_MAX_ENTRIES = 100;
-const DEFAULT_CACHE_MAX_RECORDS = 1_000_000;
 const DEFAULT_CACHE_TTL_MS = 12 * 60 * 60_000;
 const DEFAULT_MAX_CONCURRENT_ANALYTICS = 4;
-const DEFAULT_ANALYTICS_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_DIRECTORY_GRACE_MS = 2_000;
 const REFRESH_COOLDOWN_MS = 10_000;
 const JSON_BODY_LIMIT = "4kb";
 const CONFIGURATION_SUPERSEDED_RESPONSE = {
@@ -137,6 +155,97 @@ function hasLoopbackOrigin(origin: string): boolean {
   }
 }
 
+function datasetFromResponse(response: McpResponse): McpDataset {
+  const days = new Map<string, McpResponse["records"]>();
+  for (const record of response.records) {
+    const day = days.get(record.date);
+    if (day) day.push(record);
+    else days.set(record.date, [record]);
+  }
+  return createMemoryDataset(
+    [...days].map(([date, records]) => ({ date, records })),
+    {
+      range: response.range,
+      generatedAt: response.generatedAt,
+      ...(response.team
+        ? { team: { id: response.team.id, name: response.team.name } }
+        : {}),
+      notices: response.notices ?? [],
+    },
+  );
+}
+
+function directoryNotices(directory: DirectorySnapshot): McpResponseNotice[] {
+  if (directory.metadata) return [];
+  if (directory.status === "loading") {
+    const progress = directory.progress;
+    const detail =
+      progress?.totalGroups === undefined
+        ? "team members are loading"
+        : `${formatCount(progress.completedGroups)} of ${formatCount(progress.totalGroups)} groups loaded`;
+    return [
+      {
+        code: "DIRECTORY_LOADING",
+        message: `Directory groups are still loading (${detail}). Activity is complete; names, roles, and group filters update when the directory finishes loading.`,
+      },
+    ];
+  }
+  if (directory.status === "failed") {
+    return [
+      {
+        code: "DIRECTORY_UNAVAILABLE",
+        message:
+          "Directory groups could not be loaded. Activity is complete; names, roles, and group filters are unavailable until a later request loads the directory.",
+      },
+    ];
+  }
+  return [];
+}
+
+function directoryProgress(directory: DirectorySnapshot) {
+  return {
+    status: directory.status,
+    completedGroups: directory.progress?.completedGroups ?? 0,
+    totalGroups: directory.progress?.totalGroups ?? null,
+  };
+}
+
+/** Writes with backpressure and fails once the client has gone away. */
+function responseWriter(response: Response): ChunkWriter {
+  return (chunk) =>
+    new Promise<void>((resolve, reject) => {
+      if (response.destroyed || response.writableEnded) {
+        reject(new Error("Response closed"));
+        return;
+      }
+      if (response.write(chunk)) {
+        resolve();
+        return;
+      }
+      const cleanup = () => {
+        response.off("drain", onDrain);
+        response.off("close", onClose);
+      };
+      const onDrain = () => {
+        cleanup();
+        resolve();
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("Response closed"));
+      };
+      response.once("drain", onDrain);
+      response.once("close", onClose);
+    });
+}
+
+async function isRejected(promise: Promise<unknown>): Promise<boolean> {
+  return promise.then(
+    () => false,
+    () => true,
+  );
+}
+
 function publicCursorError(error: CursorApiError): string {
   if (error.status === 429) {
     return "Cursor API rate limit exceeded. Try again shortly.";
@@ -159,10 +268,13 @@ export function createApp({
   teamName = "",
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
   cacheMaxEntries = DEFAULT_CACHE_MAX_ENTRIES,
-  cacheMaxRecords = DEFAULT_CACHE_MAX_RECORDS,
-  maxEnrichedGroupAssignments = DEFAULT_CURSOR_API_LIMITS.maxEnrichedGroupAssignments,
+  cacheMaxRecords = DEFAULT_RUNTIME_SETTINGS.maxCachedRecords,
+  maxEnrichedGroupAssignments = DEFAULT_RUNTIME_SETTINGS.maxEnrichedGroupAssignments,
   maxConcurrentAnalytics = DEFAULT_MAX_CONCURRENT_ANALYTICS,
-  analyticsTimeoutMs = DEFAULT_ANALYTICS_TIMEOUT_MS,
+  analyticsTimeoutMs = DEFAULT_RUNTIME_SETTINGS.analyticsTimeoutMs,
+  directoryTimeoutMs = DEFAULT_RUNTIME_SETTINGS.directoryTimeoutMs,
+  directoryGraceMs = DEFAULT_DIRECTORY_GRACE_MS,
+  activityStore,
   loopbackOnly,
   shutdownSignal,
 }: AppOptions) {
@@ -184,7 +296,7 @@ export function createApp({
   const teamMetadataCache = new TeamMetadataCache({
     enabled: loadTeamMetadata,
     ttlMs: cacheTtlMs,
-    timeoutMs: analyticsDeadlineMs,
+    timeoutMs: Math.max(1, Math.floor(directoryTimeoutMs)),
     initialMetadata: initialTeamMetadata,
     shutdownSignal,
   });
@@ -206,6 +318,61 @@ export function createApp({
       () => undefined,
     );
     return result;
+  };
+  const holdEntry = (entry: AnalyticsCacheEntry) => {
+    entry.holders += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      entry.holders -= 1;
+      if (entry.holders === 0) {
+        void entry.value.then(
+          (dataset) => dataset.release(),
+          () => undefined,
+        );
+      }
+    };
+  };
+  const removeEntry = (
+    key: string,
+    entry: AnalyticsCacheEntry,
+    abortReason?: string,
+  ) => {
+    if (cache.get(key) === entry) cache.delete(key);
+    if (abortReason && !entry.settled) {
+      entry.controller?.abort(new DOMException(abortReason, "AbortError"));
+    }
+    entry.releaseCacheHold?.();
+    entry.releaseCacheHold = undefined;
+  };
+  const clearEntries = (reason: string) => {
+    for (const [key, entry] of [...cache]) removeEntry(key, entry, reason);
+  };
+  const getClientSnapshot = (): ClientSnapshot | null =>
+    activeClient
+      ? { client: activeClient, generation: activeClientGeneration }
+      : null;
+  const isCurrentClient = ({ client, generation }: ClientSnapshot) =>
+    activeClient === client && activeClientGeneration === generation;
+  const invalidateClient = (snapshot: ClientSnapshot) => {
+    if (!isCurrentClient(snapshot)) return false;
+    activeClient = null;
+    clientReady = false;
+    activeClientGeneration += 1;
+    clearEntries("API key invalidated");
+    teamMetadataCache.clear("API key invalidated");
+    return true;
+  };
+  const ensureDirectory = (snapshot: ClientSnapshot, now = Date.now()) => {
+    teamMetadataCache.ensure(snapshot.client, now, (error) => {
+      if (
+        error instanceof CursorApiError &&
+        (error.status === 401 || error.status === 403)
+      ) {
+        invalidateClient(snapshot);
+      }
+    });
   };
   const applyApiKey = async (apiKey: string) => {
     if (!setup) throw new Error("API key configuration is unavailable.");
@@ -240,42 +407,21 @@ export function createApp({
         configurationController = undefined;
       }
       await setup.persist?.(apiKey);
+      // A cache failure only disables persistence; it must not block setup.
+      await activityStore?.activate(apiKey).catch(() => undefined);
       activeClient =
         configured instanceof CursorApiClient ? configured : configured.client;
       clientReady = true;
       activeClientGeneration += 1;
-      for (const entry of cache.values()) {
-        entry.controller?.abort(
-          new DOMException("API key changed", "AbortError"),
-        );
-      }
-      cache.clear();
+      clearEntries("API key changed");
       teamMetadataCache.clear("API key changed");
       if (!(configured instanceof CursorApiClient)) {
         teamMetadataCache.seed(configured.metadata);
       }
+      const snapshot = getClientSnapshot();
+      if (snapshot) ensureDirectory(snapshot);
       return true;
     });
-  };
-  const getClientSnapshot = (): ClientSnapshot | null =>
-    activeClient
-      ? { client: activeClient, generation: activeClientGeneration }
-      : null;
-  const isCurrentClient = ({ client, generation }: ClientSnapshot) =>
-    activeClient === client && activeClientGeneration === generation;
-  const invalidateClient = (snapshot: ClientSnapshot) => {
-    if (!isCurrentClient(snapshot)) return false;
-    activeClient = null;
-    clientReady = false;
-    activeClientGeneration += 1;
-    for (const entry of cache.values()) {
-      entry.controller?.abort(
-        new DOMException("API key invalidated", "AbortError"),
-      );
-    }
-    cache.clear();
-    teamMetadataCache.clear("API key invalidated");
-    return true;
   };
   const pruneCache = (now: number, protectedEntry?: AnalyticsCacheEntry) => {
     for (const [key, refreshedAt] of refreshTimes) {
@@ -283,15 +429,10 @@ export function createApp({
         refreshTimes.delete(key);
       }
     }
-    for (const [key, entry] of cache) {
+    for (const [key, entry] of [...cache]) {
       if (entry.expiresAt <= now) {
         if (!entry.settled && entry.subscribers > 0) continue;
-        cache.delete(key);
-        if (!entry.settled) {
-          entry.controller?.abort(
-            new DOMException("Analytics cache entry expired", "AbortError"),
-          );
-        }
+        removeEntry(key, entry, "Analytics cache entry expired");
       }
     }
     while (cache.size > maxCacheEntries) {
@@ -301,13 +442,7 @@ export function createApp({
           (entry.settled || entry.subscribers === 0),
       );
       if (!oldest) break;
-      const [oldestKey, oldestEntry] = oldest;
-      cache.delete(oldestKey);
-      if (!oldestEntry.settled) {
-        oldestEntry.controller?.abort(
-          new DOMException("Analytics cache capacity exceeded", "AbortError"),
-        );
-      }
+      removeEntry(oldest[0], oldest[1], "Analytics cache capacity exceeded");
     }
     let cachedRecords = [...cache.values()].reduce(
       (total, entry) => total + entry.recordCount,
@@ -319,14 +454,17 @@ export function createApp({
       );
       if (!oldest) break;
       const [oldestKey, oldestEntry] = oldest;
-      cache.delete(oldestKey);
+      removeEntry(oldestKey, oldestEntry);
       cachedRecords -= oldestEntry.recordCount;
     }
   };
   const cacheResponse = (key: string, entry: AnalyticsCacheEntry) => {
     if (maxCacheEntries === 0) return;
+    const previous = cache.get(key);
+    if (previous && previous !== entry) removeEntry(key, previous);
     cache.delete(key);
     cache.set(key, entry);
+    entry.releaseCacheHold = holdEntry(entry);
     pruneCache(Date.now(), entry);
   };
   const createAnalyticsEntry = (
@@ -341,12 +479,11 @@ export function createApp({
     activeAnalyticsJobs += 1;
     const controller = new AbortController();
     const timeoutSignal = AbortSignal.timeout(analyticsDeadlineMs);
-    const signal = AbortSignal.any([
+    const cancelSignal = AbortSignal.any([
       controller.signal,
-      timeoutSignal,
       ...(shutdownSignal ? [shutdownSignal] : []),
     ]);
-    const result = deferred<McpResponse>();
+    const result = deferred<McpDataset>();
     const entry: AnalyticsCacheEntry = {
       controller,
       expiresAt: now + cacheTtlMs,
@@ -356,53 +493,38 @@ export function createApp({
       recordCount: 0,
       settled: false,
       subscribers: 0,
+      holders: 0,
       value: result.promise,
     };
-    const notifyProgress = () => {
+    const onProgress = (progress: McpFetchProgress) => {
+      entry.progress = progress;
+      entry.progressEvents.push(progress);
       for (const listener of entry.progressListeners) listener();
     };
-    const metadataEntry = teamMetadataCache.load(
-      snapshot.client,
-      now,
-      (progress) => {
-        entry.metadataProgress = progress;
-        entry.progressEvents.push({ kind: "metadata", progress });
-        notifyProgress();
-      },
-    );
-    const metadata = metadataEntry.value;
-    const analytics = snapshot.client.fetchMcp(
-      startDate,
-      endDate,
-      new Map(),
-      (progress) => {
-        entry.progress = progress;
-        entry.progressEvents.push({ kind: "analytics", progress });
-        notifyProgress();
-      },
-      signal,
-    );
-    const operation = Promise.all([analytics, metadata])
-      .then(([mcp, teamDetails]) => {
-        if (isCurrentClient(snapshot)) {
-          clientReady = true;
-          teamMetadataCache.commit(metadataEntry, teamDetails);
-        }
-        const result = enrichMcpResponse(
-          mcp,
-          teamDetails,
-          teamName,
-          maxEnrichedGroupAssignments,
-        );
-        entry.recordCount = result.records.length;
-        return result;
+    ensureDirectory(snapshot, now);
+    // Without disk storage, records are collected in memory.
+    const analytics: Promise<McpDataset> = activityStore
+      ? snapshot.client.fetchMcpDataset(startDate, endDate, {
+          onProgress,
+          signal: cancelSignal,
+          deadline: timeoutSignal,
+          deadlineMs: analyticsDeadlineMs,
+          runs: activityStore,
+        })
+      : snapshot.client
+          .fetchMcp(startDate, endDate, new Map(), onProgress, cancelSignal, {
+            signal: timeoutSignal,
+            milliseconds: analyticsDeadlineMs,
+          })
+          .then(datasetFromResponse);
+    const operation = analytics
+      .then((dataset) => {
+        if (isCurrentClient(snapshot)) clientReady = true;
+        entry.recordCount = dataset.recordCount;
+        return dataset;
       })
       .catch(async (error: unknown) => {
         controller.abort(error);
-        await Promise.allSettled([analytics]);
-        if (timeoutSignal.aborted && !shutdownSignal?.aborted) {
-          throw new CursorApiError("Analytics request timed out", 504);
-        }
         throw error;
       });
     void operation.then(result.resolve, result.reject);
@@ -429,20 +551,78 @@ export function createApp({
     entry: AnalyticsCacheEntry,
   ) => {
     entry.subscribers += 1;
+    const releaseHold = holdEntry(entry);
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
       entry.subscribers = Math.max(0, entry.subscribers - 1);
       if (entry.subscribers === 0 && !entry.settled) {
-        if (cache.get(key) === entry) cache.delete(key);
-        entry.controller?.abort(
-          new DOMException("All dashboard clients disconnected", "AbortError"),
-        );
+        removeEntry(key, entry, "All dashboard clients disconnected");
       }
+      releaseHold();
     };
     response.once("close", release);
     return release;
+  };
+  /**
+   * Finds or creates the entry for a range. Returns null after sending a 429
+   * when a refresh of the same range was requested too recently.
+   */
+  const resolveEntry = (
+    response: Response,
+    snapshot: ClientSnapshot,
+    startDate: string,
+    endDate: string,
+    forceRefresh: boolean,
+  ): { key: string; entry: AnalyticsCacheEntry } | null => {
+    const key = `${startDate}:${endDate}`;
+    const now = Date.now();
+    pruneCache(now);
+    let existing = cache.get(key);
+    if (existing?.controller?.signal.aborted) {
+      removeEntry(key, existing);
+      existing = undefined;
+    }
+    if (forceRefresh && existing?.settled) {
+      const lastRefresh = refreshTimes.get(key);
+      if (
+        lastRefresh !== undefined &&
+        now - lastRefresh < REFRESH_COOLDOWN_MS
+      ) {
+        response.status(429).json({
+          error: "This date range was refreshed recently. Try again shortly.",
+        });
+        return null;
+      }
+      refreshTimes.set(key, now);
+      removeEntry(key, existing);
+      teamMetadataCache.invalidateForRefresh();
+    }
+    if (forceRefresh && !existing) refreshTimes.set(key, now);
+    const cached = cache.get(key);
+    return {
+      key,
+      entry: cached ?? createAnalyticsEntry(snapshot, startDate, endDate, now),
+    };
+  };
+  /** Builds what a response needs once its dataset is ready. */
+  const responseContext = async (
+    snapshot: ClientSnapshot,
+    dataset: McpDataset,
+  ): Promise<ResponseContext> => {
+    if (isCurrentClient(snapshot)) ensureDirectory(snapshot);
+    if (!teamMetadataCache.snapshot().metadata) {
+      await teamMetadataCache.waitForLoad(directoryGraceMs);
+    }
+    const directory = teamMetadataCache.snapshot();
+    return {
+      dataset,
+      ...(directory.metadata ? { metadata: directory.metadata } : {}),
+      teamName,
+      maxEnrichedGroupAssignments,
+      notices: directoryNotices(directory),
+    };
   };
   if (initialClient && initialClientValidation) {
     const snapshot = getClientSnapshot();
@@ -457,6 +637,7 @@ export function createApp({
         if (validation.metadata) {
           teamMetadataCache.seed(validation.metadata);
         }
+        ensureDirectory(snapshot);
       }
     });
   }
@@ -514,6 +695,12 @@ export function createApp({
       configured: Boolean(activeClient),
       setupAllowed: Boolean(setup?.allowed),
     });
+  });
+
+  app.get("/api/directory/status", (_request, response) => {
+    const snapshot = getClientSnapshot();
+    if (snapshot && clientReady) ensureDirectory(snapshot);
+    response.json(directoryProgress(teamMetadataCache.snapshot()));
   });
 
   app.post("/api/setup", parseSetupBody, async (request, response, next) => {
@@ -605,6 +792,32 @@ export function createApp({
       next(error);
       return;
     }
+    let resolved: ReturnType<typeof resolveEntry>;
+    try {
+      resolved = resolveEntry(
+        response,
+        snapshot,
+        startDate,
+        endDate,
+        request.query.refresh === "1",
+      );
+    } catch (error) {
+      if (error instanceof AnalyticsCapacityError) {
+        response.status(200);
+        response.setHeader(
+          "Content-Type",
+          "application/x-ndjson; charset=utf-8",
+        );
+        response.end(
+          `${JSON.stringify({ type: "error", error: error.message })}\n`,
+        );
+        return;
+      }
+      next(error);
+      return;
+    }
+    if (!resolved) return;
+    const { key: cacheKey, entry: activeEntry } = resolved;
 
     response.status(200);
     response.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -618,138 +831,106 @@ export function createApp({
     };
     let completedWindows = 0;
     let totalWindows = 0;
-    let metadataComplete = !loadTeamMetadata;
-    let metadataFraction = metadataComplete ? 1 : 0;
-    let metadataDetail = "Loading team members and directory groups";
+    let cachedDays = 0;
     let progressLabel = "Starting";
     let progressDetail = "Connecting to Cursor";
     const progressStartedAt = Date.now();
+    const progressEvent = (label: string, detail: string) => ({
+      type: "progress",
+      completed: completedWindows,
+      total: totalWindows + 1,
+      label,
+      detail,
+      directory: directoryProgress(teamMetadataCache.snapshot()),
+    });
     const emitProgress = (label: string, detail: string) => {
       progressLabel = label;
       progressDetail = detail;
-      send({
-        type: "progress",
-        completed: completedWindows + metadataFraction,
-        total: totalWindows + 2,
-        label,
-        detail,
-      });
+      send(progressEvent(label, detail));
     };
     const heartbeat = setInterval(() => {
-      send({
-        type: "progress",
-        completed: completedWindows + metadataFraction,
-        total: totalWindows + 2,
-        label: progressLabel,
-        detail: `${progressDetail} · ${Math.max(1, Math.round((Date.now() - progressStartedAt) / 1_000))}s elapsed`,
-      });
+      send(
+        progressEvent(
+          progressLabel,
+          `${progressDetail} · ${Math.max(1, Math.round((Date.now() - progressStartedAt) / 1_000))}s elapsed`,
+        ),
+      );
     }, 2_000);
     heartbeat.unref();
+    const stopDirectoryUpdates = teamMetadataCache.subscribe(() => {
+      send(progressEvent(progressLabel, progressDetail));
+    });
     response.once("close", () => {
       clearInterval(heartbeat);
+      stopDirectoryUpdates();
     });
 
-    const cacheKey = `${startDate}:${endDate}`;
-    const now = Date.now();
-    pruneCache(now);
-    let entry = cache.get(cacheKey);
-    if (entry?.controller?.signal.aborted) {
-      cache.delete(cacheKey);
-      entry = undefined;
-    }
-    let removeProgressListener = () => undefined;
-    try {
-      if (!entry) {
-        entry = createAnalyticsEntry(snapshot, startDate, endDate, now);
+    const emitCurrentProgress = () => {
+      if (activeEntry.settled) {
+        emitProgress(
+          "Cached activity",
+          "Reusing the latest result for this date range",
+        );
+        return;
       }
-      const activeEntry = entry;
-      const applyMetadataProgress = (
-        metadataProgress: TeamMetadataProgress | undefined,
-      ) => {
-        if (metadataProgress?.totalGroups === undefined) return;
-        const totalGroups = metadataProgress.totalGroups;
-        metadataFraction =
-          totalGroups === 0
-            ? 1
-            : metadataProgress.completedGroups / totalGroups;
-        metadataDetail =
-          totalGroups === 0
-            ? "No directory groups to enrich"
-            : `${metadataProgress.completedGroups} / ${totalGroups} directory groups`;
-      };
-      const emitCurrentProgress = () => {
-        if (activeEntry.settled) {
-          emitProgress(
-            "Cached activity",
-            "Reusing the latest result for this date range",
-          );
-        } else if (
-          totalWindows > 0 &&
-          completedWindows === totalWindows &&
-          !metadataComplete
-        ) {
-          emitProgress("Team metadata", metadataDetail);
-        } else {
-          emitProgress(
-            "MCP activity",
-            `${completedWindows} / ${totalWindows} date ranges`,
-          );
-        }
-      };
-      const syncProgress = () => {
-        completedWindows = activeEntry.progress.completedWindows;
-        totalWindows = activeEntry.progress.totalWindows;
-        applyMetadataProgress(activeEntry.metadataProgress);
-        emitCurrentProgress();
-      };
-      activeEntry.progressListeners.add(syncProgress);
-      const removeListener = () => {
-        activeEntry.progressListeners.delete(syncProgress);
-      };
-      response.once("close", removeListener);
-      removeProgressListener = () => {
-        response.off("close", removeListener);
-        removeListener();
-      };
+      const cached =
+        cachedDays > 0 ? ` · ${formatCount(cachedDays)} cached days` : "";
+      emitProgress(
+        "MCP activity",
+        `${completedWindows} / ${totalWindows} date ranges${cached}`,
+      );
+    };
+    const applyProgress = (progress: McpFetchProgress) => {
+      completedWindows = progress.completedWindows;
+      totalWindows = progress.totalWindows;
+      cachedDays = progress.cachedDays ?? 0;
+    };
+    const syncProgress = () => {
+      applyProgress(activeEntry.progress);
+      emitCurrentProgress();
+    };
+    activeEntry.progressListeners.add(syncProgress);
+    const removeProgressListener = () => {
+      activeEntry.progressListeners.delete(syncProgress);
+    };
+    response.once("close", removeProgressListener);
+    const release = subscribeToEntry(response, cacheKey, activeEntry);
+    try {
       if (activeEntry.settled || activeEntry.progressEvents.length === 0) {
         syncProgress();
       } else {
-        for (const event of activeEntry.progressEvents) {
-          if (event.kind === "analytics") {
-            completedWindows = event.progress.completedWindows;
-            totalWindows = event.progress.totalWindows;
-          } else {
-            applyMetadataProgress(event.progress);
-          }
+        for (const progress of activeEntry.progressEvents) {
+          applyProgress(progress);
           emitCurrentProgress();
         }
       }
-      const release = subscribeToEntry(response, cacheKey, activeEntry);
-      const result = await activeEntry.value;
-      release();
+      const dataset = await activeEntry.value;
       removeProgressListener();
-      metadataComplete = true;
-      metadataFraction = 1;
+      completedWindows = totalWindows;
+      const context = await responseContext(snapshot, dataset);
       send({
         type: "progress",
-        completed: totalWindows + 2,
-        total: totalWindows + 2,
+        completed: totalWindows + 1,
+        total: totalWindows + 1,
         label: "Ready",
-        detail: `${result.records.length.toLocaleString()} activity rows`,
+        detail: `${formatCount(dataset.recordCount)} activity rows`,
+        directory: directoryProgress(teamMetadataCache.snapshot()),
       });
-      send({ type: "data", data: result });
+      clearInterval(heartbeat);
+      stopDirectoryUpdates();
+      await writeNdjsonResponse(responseWriter(response), context);
       if (isCurrentClient(snapshot)) {
         activeEntry.expiresAt = Date.now() + cacheTtlMs;
       }
-      clearInterval(heartbeat);
       response.end();
     } catch (error) {
       removeProgressListener();
-      if (entry && cache.get(cacheKey) === entry) cache.delete(cacheKey);
-      if (response.destroyed) {
-        clearInterval(heartbeat);
-        return;
+      clearInterval(heartbeat);
+      stopDirectoryUpdates();
+      if (!activeEntry.settled || (await isRejected(activeEntry.value))) {
+        removeEntry(cacheKey, activeEntry);
       }
+      if (response.destroyed) return;
       if (
         error instanceof CursorApiError &&
         (error.status === 401 || error.status === 403)
@@ -768,15 +949,14 @@ export function createApp({
         send({
           type: "error",
           error:
-            error instanceof AnalyticsCapacityError
-              ? error.message
-              : error instanceof CursorApiError
-                ? publicCursorError(error)
-                : "Could not load MCP analytics.",
+            error instanceof CursorApiError
+              ? publicCursorError(error)
+              : "Could not load MCP analytics.",
         });
       }
-      clearInterval(heartbeat);
       response.end();
+    } finally {
+      release();
     }
   });
 
@@ -810,41 +990,35 @@ export function createApp({
         request.query.startDate,
         request.query.endDate,
       );
-      const cacheKey = `${startDate}:${endDate}`;
-      const forceRefresh = request.query.refresh === "1";
-      const now = Date.now();
-      pruneCache(now);
-      let existing = cache.get(cacheKey);
-      if (existing?.controller?.signal.aborted) {
-        cache.delete(cacheKey);
-        existing = undefined;
-      }
-      if (forceRefresh && existing?.settled) {
-        const lastRefresh = refreshTimes.get(cacheKey);
-        if (
-          lastRefresh !== undefined &&
-          now - lastRefresh < REFRESH_COOLDOWN_MS
-        ) {
-          response.status(429).json({
-            error: "This date range was refreshed recently. Try again shortly.",
-          });
-          return;
-        }
-        refreshTimes.set(cacheKey, now);
-        cache.delete(cacheKey);
-        teamMetadataCache.invalidateForRefresh("Analytics refresh requested");
-      }
-      if (forceRefresh && !existing) refreshTimes.set(cacheKey, now);
-      const cached = cache.get(cacheKey);
-      const entry =
-        cached ?? createAnalyticsEntry(snapshot, startDate, endDate, now);
+      const resolved = resolveEntry(
+        response,
+        snapshot,
+        startDate,
+        endDate,
+        request.query.refresh === "1",
+      );
+      if (!resolved) return;
+      const { key: cacheKey, entry } = resolved;
       const release = subscribeToEntry(response, cacheKey, entry);
 
       try {
-        response.json(await entry.value);
-      } catch (error) {
-        if (cache.get(cacheKey) === entry) cache.delete(cacheKey);
-        throw error;
+        let dataset: McpDataset;
+        try {
+          dataset = await entry.value;
+        } catch (error) {
+          removeEntry(cacheKey, entry);
+          throw error;
+        }
+        const context = await responseContext(snapshot, dataset);
+        response.status(200);
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        try {
+          await writeJsonResponse(responseWriter(response), context);
+          response.end();
+        } catch {
+          // Headers are sent, so a failure can only end the connection.
+          response.destroy();
+        }
       } finally {
         release();
       }

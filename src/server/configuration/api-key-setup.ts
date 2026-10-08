@@ -13,13 +13,17 @@ function hasErrorCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
+/**
+ * Validates a saved key with one lightweight request. Team metadata is
+ * loaded separately in the background once the key is known to work.
+ */
 export async function validateSavedClient(
   client: CursorApiClient,
   signal?: AbortSignal,
 ): Promise<SavedKeyValidation> {
   try {
-    const metadata = await client.fetchTeamMetadata(signal);
-    return { client, metadata, status: "valid" };
+    await client.validateApiKey(signal);
+    return { client, status: "valid" };
   } catch (error) {
     if (
       error instanceof CursorApiError &&

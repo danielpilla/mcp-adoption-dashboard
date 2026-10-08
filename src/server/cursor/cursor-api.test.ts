@@ -2,11 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CursorApiClient,
   DEFAULT_CURSOR_API_LIMITS,
-  enrichMcpResponse,
   retryDelayMilliseconds,
-  type TeamMetadata,
 } from "./cursor-api";
-import type { McpResponse } from "../../contracts/mcp-response";
 
 function jsonResponse(body: unknown, status = 200, headers?: HeadersInit) {
   return new Response(JSON.stringify(body), {
@@ -1330,59 +1327,5 @@ describe("CursorApiClient", () => {
       status: 502,
       message: "Cursor API returned a duplicate MCP metric",
     });
-  });
-
-  it("bounds group assignments added during enrichment", () => {
-    const response: McpResponse = {
-      records: [
-        {
-          date: "2026-09-01",
-          userId: "user-1",
-          email: "user@example.test",
-          displayName: "User",
-          server: "github",
-          tool: "search",
-          usage: 1,
-        },
-      ],
-      summary: {
-        totalUsage: 1,
-        uniqueUsers: 1,
-        uniqueServers: 1,
-        uniqueTools: 1,
-      },
-      range: {
-        startDate: "2026-09-01",
-        endDate: "2026-09-01",
-      },
-      generatedAt: "2026-09-01T12:00:00.000Z",
-      source: "live",
-    };
-    const metadata: TeamMetadata = {
-      users: new Map([
-        [
-          "user@example.test",
-          {
-            name: "User",
-            role: "member",
-            directoryGroups: ["One", "Two"],
-          },
-        ],
-      ]),
-      memberCount: 1,
-      groupNames: ["One", "Two"],
-    };
-
-    expect(() => enrichMcpResponse(response, metadata, "", 1)).toThrow(
-      "Enriched group assignments exceed the configured safety limit",
-    );
-
-    const enriched = enrichMcpResponse(response, metadata, "", 2);
-    expect(enriched).not.toBe(response);
-    expect(enriched.records[0]).toMatchObject({
-      role: "member",
-      directoryGroups: ["One", "Two"],
-    });
-    expect(response.records[0]).not.toHaveProperty("role");
   });
 });

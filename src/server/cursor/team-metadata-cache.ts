@@ -4,39 +4,47 @@ import {
   type TeamMetadataProgress,
 } from "./cursor-api.js";
 
-export interface TeamMetadataLoad {
-  value: Promise<TeamMetadata>;
-  generation: number;
+type DirectoryStatus = "disabled" | "idle" | "loading" | "ready" | "failed";
+
+export interface DirectorySnapshot {
+  status: DirectoryStatus;
+  /** The latest loaded directory, kept while a refresh is in progress. */
+  metadata?: TeamMetadata;
+  progress?: TeamMetadataProgress;
 }
 
 interface TeamMetadataCacheOptions {
   enabled: boolean;
   ttlMs: number;
+  /** Directory loads stop at this deadline and keep what was loaded. */
   timeoutMs: number;
   initialMetadata?: TeamMetadata;
   shutdownSignal?: AbortSignal;
 }
 
-interface CacheEntry extends TeamMetadataLoad {
-  expiresAt: number;
+interface ActiveLoad {
+  controller: AbortController;
+  promise: Promise<void>;
+  progress?: TeamMetadataProgress;
 }
 
-function emptyTeamMetadata(): TeamMetadata {
-  return {
-    users: new Map(),
-    memberCount: 0,
-    groupNames: [],
-  };
-}
-
+/**
+ * Loads team members, directory groups, and memberships in the background.
+ * Callers read the latest snapshot instead of waiting, so analytics never
+ * block on a large directory. Expired metadata stays available until a
+ * replacement finishes loading.
+ */
 export class TeamMetadataCache {
   private readonly enabled: boolean;
   private readonly ttlMs: number;
   private readonly timeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
-  private controller?: AbortController;
+  private readonly listeners = new Set<() => void>();
   private generation = 0;
-  private entry: CacheEntry | null;
+  private metadata?: TeamMetadata;
+  private expiresAt = 0;
+  private failed = false;
+  private active?: ActiveLoad;
 
   constructor({
     enabled,
@@ -49,81 +57,118 @@ export class TeamMetadataCache {
     this.ttlMs = ttlMs;
     this.timeoutMs = timeoutMs;
     this.shutdownSignal = shutdownSignal;
-    this.entry = initialMetadata
-      ? this.resolvedEntry(initialMetadata, Date.now())
-      : null;
+    if (initialMetadata) this.seed(initialMetadata);
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) listener();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   clear(reason: string): void {
     this.generation += 1;
-    this.controller?.abort(new DOMException(reason, "AbortError"));
-    this.controller = undefined;
-    this.entry = null;
+    this.active?.controller.abort(new DOMException(reason, "AbortError"));
+    this.active = undefined;
+    this.metadata = undefined;
+    this.expiresAt = 0;
+    this.failed = false;
+    this.notify();
   }
 
   seed(metadata: TeamMetadata, now = Date.now()): void {
-    this.entry = this.resolvedEntry(metadata, now);
+    this.metadata = metadata;
+    this.expiresAt = now + this.ttlMs;
+    this.failed = false;
+    this.notify();
   }
 
-  invalidateForRefresh(reason: string): void {
-    // Metadata is global to the team. A concurrent range refresh should share
-    // active work rather than aborting requests that already depend on it.
-    if (!this.controller) this.clear(reason);
+  /** Marks loaded metadata stale; an active load is shared, not restarted. */
+  invalidateForRefresh(): void {
+    if (!this.active) this.expiresAt = 0;
   }
 
-  load(
-    client: CursorApiClient,
-    now: number,
-    onProgress?: (progress: TeamMetadataProgress) => void,
-  ): TeamMetadataLoad {
-    if (!this.enabled) {
+  snapshot(): DirectorySnapshot {
+    if (!this.enabled) return { status: "disabled" };
+    const metadata = this.metadata ? { metadata: this.metadata } : {};
+    if (this.active) {
       return {
-        value: Promise.resolve(emptyTeamMetadata()),
-        generation: this.generation,
+        status: "loading",
+        ...metadata,
+        ...(this.active.progress ? { progress: this.active.progress } : {}),
       };
     }
-    if (!this.entry || this.entry.expiresAt <= now) {
-      this.clear("Team metadata cache expired");
-      const controller = new AbortController();
-      this.controller = controller;
-      const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
-      const signal = AbortSignal.any([
-        controller.signal,
-        timeoutSignal,
-        ...(this.shutdownSignal ? [this.shutdownSignal] : []),
-      ]);
-      const value = client.fetchTeamMetadata(signal, onProgress);
-      const entry: CacheEntry = {
-        value,
-        expiresAt: now + this.ttlMs,
-        generation: this.generation,
-      };
-      this.entry = entry;
-      void value
-        .catch(() => {
-          if (this.entry === entry) this.entry = null;
-        })
-        .finally(() => {
-          if (this.controller === controller) this.controller = undefined;
-        });
-    }
-    return this.entry;
+    if (this.metadata) return { status: "ready", ...metadata };
+    return { status: this.failed ? "failed" : "idle" };
   }
 
-  commit(
-    load: TeamMetadataLoad,
-    metadata: TeamMetadata,
+  /**
+   * Starts a background load unless current metadata is fresh or a load is
+   * already running. `onError` receives load failures for this client.
+   */
+  ensure(
+    client: CursorApiClient,
     now = Date.now(),
+    onError?: (error: unknown) => void,
   ): void {
-    if (load.generation !== this.generation) return;
-    this.entry = this.resolvedEntry(metadata, now);
+    if (!this.enabled || this.active) return;
+    if (this.metadata && this.expiresAt > now) return;
+    const generation = this.generation;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([
+      controller.signal,
+      ...(this.shutdownSignal ? [this.shutdownSignal] : []),
+    ]);
+    const deadline = AbortSignal.timeout(this.timeoutMs);
+    const load: ActiveLoad = { controller, promise: Promise.resolve() };
+    this.active = load;
+    this.failed = false;
+    load.promise = client
+      .fetchTeamMetadata(
+        signal,
+        (progress) => {
+          if (this.active !== load) return;
+          load.progress = progress;
+          this.notify();
+        },
+        deadline,
+        this.timeoutMs,
+      )
+      .then(
+        (metadata) => {
+          if (this.generation !== generation) return;
+          this.metadata = metadata;
+          this.expiresAt = Date.now() + this.ttlMs;
+        },
+        (error: unknown) => {
+          if (this.generation !== generation || signal.aborted) return;
+          this.failed = true;
+          onError?.(error);
+        },
+      )
+      .finally(() => {
+        if (this.active === load) this.active = undefined;
+        this.notify();
+      });
   }
 
-  private resolvedEntry(metadata: TeamMetadata, now: number): CacheEntry {
-    return {
-      value: Promise.resolve(metadata),
-      expiresAt: now + this.ttlMs,
-      generation: this.generation,
-    };
+  /** Waits up to `milliseconds` for an active load to finish. */
+  async waitForLoad(milliseconds: number): Promise<void> {
+    const active = this.active;
+    if (!active || milliseconds <= 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      active.promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, milliseconds);
+        timer.unref();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 }

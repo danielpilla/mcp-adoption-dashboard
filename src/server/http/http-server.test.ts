@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "./http-server";
+import { McpDayCache } from "../cache/mcp-day-cache";
 import {
   CursorApiClient,
   CursorApiError,
@@ -84,6 +85,47 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function datesBetween(startDate: string, endDate: string): string[] {
+  const dates = [];
+  for (
+    let date = new Date(`${startDate}T00:00:00Z`);
+    date <= new Date(`${endDate}T00:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + 1)
+  ) {
+    dates.push(date.toISOString().slice(0, 10));
+  }
+  return dates;
+}
+
+/** Answers every analytics window with one record per day. */
+function dailyActivityFetcher(
+  hold?: (startDate: string, signal?: AbortSignal | null) => Promise<void>,
+) {
+  return vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+    const url = new URL(String(input));
+    const startDate = url.searchParams.get("startDate") ?? "";
+    await hold?.(startDate, init?.signal);
+    const dates = datesBetween(
+      startDate,
+      url.searchParams.get("endDate") ?? "",
+    );
+    return new Response(
+      JSON.stringify({
+        data: {
+          "user-1@example.com": dates.map((date) => ({
+            event_date: date,
+            tool_name: "tool-1",
+            mcp_server_name: "server-1",
+            usage: 1,
+          })),
+        },
+        pagination: { hasNextPage: false },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  });
 }
 
 describe("server hardening", () => {
@@ -572,7 +614,7 @@ describe("MCP API endpoint", () => {
     expect(fetchMcp).toHaveBeenCalledTimes(3);
   });
 
-  it("fails closed when required team metadata is unavailable", async () => {
+  it("serves activity with a notice when the directory cannot be loaded", async () => {
     const client = new CursorApiClient("test-key");
     vi.spyOn(client, "fetchMcp").mockResolvedValue(
       structuredClone(emptyMcpResponse),
@@ -587,62 +629,94 @@ describe("MCP API endpoint", () => {
     );
     const body = await response.json();
 
-    expect(response.status).toBe(502);
-    expect(body.error).toBe("Could not load data from Cursor.");
+    expect(response.status).toBe(200);
+    expect(body.notices).toEqual([
+      expect.objectContaining({ code: "DIRECTORY_UNAVAILABLE" }),
+    ]);
   });
 
-  it("aborts analytics when the sibling metadata request fails", async () => {
+  it("does not wait for a directory that is still loading", async () => {
     const client = new CursorApiClient("test-key");
-    const signalSeen = deferred<AbortSignal>();
-    vi.spyOn(client, "fetchMcp").mockImplementation(
-      async (_startDate, _endDate, _memberNames, _onProgress, signal) =>
-        new Promise<McpResponse>((_resolve, reject) => {
-          if (!signal) throw new Error("Expected an abort signal");
-          signalSeen.resolve(signal);
-          signal.addEventListener("abort", () => reject(signal.reason), {
-            once: true,
-          });
-        }),
-    );
-    vi.spyOn(client, "fetchTeamMetadata").mockRejectedValue(
-      new CursorApiError("metadata unavailable", 503),
-    );
-    const baseUrl = await listen(createApp({ client }));
+    vi.spyOn(client, "fetchMcp").mockResolvedValue({
+      ...structuredClone(emptyMcpResponse),
+      records: [
+        {
+          date: "2026-09-02",
+          userId: "user-1",
+          email: "user-1@example.com",
+          displayName: "user-1",
+          server: "server-1",
+          tool: "tool-1",
+          usage: 4,
+        },
+      ],
+    });
+    const fetchTeamMetadata = vi
+      .spyOn(client, "fetchTeamMetadata")
+      .mockImplementation(async (_signal, onProgress) => {
+        onProgress?.({ completedGroups: 1, totalGroups: 3 });
+        return new Promise<TeamMetadata>(() => {});
+      });
+    const baseUrl = await listen(createApp({ client, directoryGraceMs: 0 }));
 
     const response = await fetch(
       `${baseUrl}/api/mcp?startDate=2026-09-01&endDate=2026-09-18`,
     );
+    const body = await response.json();
+    const status = await fetch(`${baseUrl}/api/directory/status`);
 
-    expect(response.status).toBe(502);
-    expect((await signalSeen.promise).aborted).toBe(true);
+    expect(response.status).toBe(200);
+    expect(body.summary.totalUsage).toBe(4);
+    expect(body.notices).toEqual([
+      expect.objectContaining({
+        code: "DIRECTORY_LOADING",
+        message: expect.stringContaining("1 of 3 groups loaded"),
+      }),
+    ]);
+    expect(await status.json()).toEqual({
+      status: "loading",
+      completedGroups: 1,
+      totalGroups: 3,
+    });
+    expect(fetchTeamMetadata).toHaveBeenCalledOnce();
   });
 
-  it("returns a dependency timeout when analytics exceeds its deadline", async () => {
-    const client = new CursorApiClient("test-key");
-    vi.spyOn(client, "fetchMcp").mockImplementation(
-      async (_startDate, _endDate, _memberNames, _onProgress, signal) =>
-        new Promise<McpResponse>((_resolve, reject) => {
-          signal?.addEventListener("abort", () => reject(signal.reason), {
-            once: true,
-          });
-        }),
+  it("returns the loaded days when analytics exceeds its deadline in memory", async () => {
+    const fetcher = dailyActivityFetcher(async (startDate, signal) => {
+      if (startDate !== "2026-07-21") return;
+      await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      fetcher,
     );
     const baseUrl = await listen(
       createApp({
         client,
         loadTeamMetadata: false,
-        analyticsTimeoutMs: 10,
+        analyticsTimeoutMs: 100,
       }),
     );
 
     const response = await fetch(
-      `${baseUrl}/api/mcp?startDate=2026-09-01&endDate=2026-09-18`,
+      `${baseUrl}/api/mcp?startDate=2026-07-21&endDate=2026-09-18`,
     );
+    const body = (await response.json()) as McpResponse;
 
-    expect(response.status).toBe(504);
-    expect(await response.json()).toEqual({
-      error: "Cursor API request timed out.",
-    });
+    expect(response.status).toBe(200);
+    expect(body.records).toHaveLength(30);
+    expect(body.notices).toEqual([
+      expect.objectContaining({
+        setting: "ANALYTICS_TIMEOUT_MS",
+        limit: 100,
+        completeFrom: "2026-08-20",
+      }),
+    ]);
   });
 
   it("does not expose upstream response details", async () => {
@@ -705,16 +779,16 @@ describe("MCP API endpoint", () => {
         .filter((event) => event.type === "progress")
         .map((event) => [event.completed, event.total]),
     ).toEqual([
-      [1, 5],
-      [2, 5],
-      [3, 5],
-      [4, 5],
-      [5, 5],
+      [0, 4],
+      [1, 4],
+      [2, 4],
+      [3, 4],
+      [4, 4],
     ]);
     expect(events.at(-1)?.type).toBe("data");
   });
 
-  it("streams directory-group enrichment progress after analytics completes", async () => {
+  it("streams directory progress and waits briefly for a finishing directory", async () => {
     const client = new CursorApiClient("test-key");
     const metadataResult = deferred<TeamMetadata>();
     let reportMetadata:
@@ -749,22 +823,20 @@ describe("MCP API endpoint", () => {
         (line) =>
           JSON.parse(line) as {
             type: string;
-            completed?: number;
-            total?: number;
-            label?: string;
-            detail?: string;
+            directory?: unknown;
+            data?: McpResponse;
           },
       );
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "progress",
-        completed: 3.5,
-        total: 5,
-        label: "Team metadata",
-        detail: "1 / 2 directory groups",
+        directory: { status: "loading", completedGroups: 1, totalGroups: 2 },
       }),
     );
-    expect(events.at(-1)?.type).toBe("data");
+    const data = events.at(-1);
+    expect(data?.type).toBe("data");
+    expect(data?.data?.team?.groupCount).toBe(1);
+    expect(data?.data).not.toHaveProperty("notices");
   });
 
   it("reuses team metadata validated during startup", async () => {
@@ -959,6 +1031,189 @@ describe("MCP API endpoint", () => {
     expect(await response.json()).toEqual({
       error: "Cursor API rejected the request.",
     });
+  });
+});
+
+describe("MCP API with the day cache", () => {
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      directories
+        .splice(0)
+        .map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+  });
+
+  async function createStore() {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-http-cache-"));
+    directories.push(directory);
+    const store = new McpDayCache({
+      directory,
+      maxBytes: 1024 * 1024,
+      refetchDays: 2,
+    });
+    await store.open();
+    await store.activate("test-key");
+    return store;
+  }
+
+  it("serves partial activity with a notice at a cap and keeps serving", async () => {
+    const fetcher = dailyActivityFetcher();
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      fetcher,
+      undefined,
+      "",
+      10,
+    );
+    const baseUrl = await listen(
+      createApp({
+        client,
+        loadTeamMetadata: false,
+        activityStore: await createStore(),
+      }),
+    );
+
+    const response = await fetch(
+      `${baseUrl}/api/mcp?startDate=2026-07-21&endDate=2026-09-18`,
+    );
+    const body = (await response.json()) as McpResponse;
+
+    expect(response.status).toBe(200);
+    expect(body.records.map((record) => record.date)).toEqual(
+      datesBetween("2026-09-09", "2026-09-18"),
+    );
+    expect(body.notices).toEqual([
+      expect.objectContaining({
+        code: "LIMIT_REACHED",
+        setting: "MAX_MCP_RECORDS",
+        limit: 10,
+      }),
+    ]);
+    expect((await fetch(`${baseUrl}/api/health`)).status).toBe(200);
+    const next = await fetch(
+      `${baseUrl}/api/mcp?startDate=2026-09-10&endDate=2026-09-12`,
+    );
+    expect(next.status).toBe(200);
+    expect(((await next.json()) as McpResponse).notices).toBeUndefined();
+  });
+
+  it("serves the loaded days when analytics exceeds its deadline", async () => {
+    const fetcher = dailyActivityFetcher(async (startDate, signal) => {
+      if (startDate !== "2026-07-21") return;
+      await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    });
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      fetcher,
+    );
+    const baseUrl = await listen(
+      createApp({
+        client,
+        loadTeamMetadata: false,
+        analyticsTimeoutMs: 100,
+        activityStore: await createStore(),
+      }),
+    );
+
+    const response = await fetch(
+      `${baseUrl}/api/mcp?startDate=2026-07-21&endDate=2026-09-18`,
+    );
+    const body = (await response.json()) as McpResponse;
+
+    expect(response.status).toBe(200);
+    expect(body.records).toHaveLength(30);
+    expect(body.notices).toEqual([
+      expect.objectContaining({
+        setting: "ANALYTICS_TIMEOUT_MS",
+        completeFrom: "2026-08-20",
+      }),
+    ]);
+  });
+
+  it("streams record batches before the final data event", async () => {
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      dailyActivityFetcher(),
+    );
+    const baseUrl = await listen(
+      createApp({
+        client,
+        loadTeamMetadata: false,
+        activityStore: await createStore(),
+      }),
+    );
+
+    const response = await fetch(
+      `${baseUrl}/api/mcp/stream?startDate=2026-09-01&endDate=2026-09-05`,
+    );
+    const events = (await response.text())
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            type: string;
+            records?: { date: string }[];
+            data?: McpResponse;
+          },
+      );
+
+    const records = events
+      .filter((event) => event.type === "records")
+      .flatMap((event) => event.records ?? []);
+    expect(records.map((record) => record.date)).toEqual(
+      datesBetween("2026-09-01", "2026-09-05"),
+    );
+    expect(events.at(-1)?.type).toBe("data");
+    expect(events.at(-1)?.data).not.toHaveProperty("records");
+    expect(events.at(-1)?.data?.summary.totalUsage).toBe(5);
+  });
+
+  it("refetches only uncached days when a range is refreshed", async () => {
+    const fetcher = dailyActivityFetcher();
+    const client = new CursorApiClient(
+      "test-key",
+      "https://cursor.test",
+      fetcher,
+    );
+    const baseUrl = await listen(
+      createApp({
+        client,
+        loadTeamMetadata: false,
+        activityStore: await createStore(),
+      }),
+    );
+    const today = new Date().toISOString().slice(0, 10);
+    const startDate = new Date(Date.now() - 9 * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+
+    await (
+      await fetch(`${baseUrl}/api/mcp?startDate=${startDate}&endDate=${today}`)
+    ).json();
+    fetcher.mockClear();
+    const refreshed = (await (
+      await fetch(
+        `${baseUrl}/api/mcp?startDate=${startDate}&endDate=${today}&refresh=1`,
+      )
+    ).json()) as McpResponse;
+
+    expect(refreshed.records).toHaveLength(10);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(url.searchParams.get("endDate")).toBe(today);
+    expect(url.searchParams.get("startDate")).toBe(
+      new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10),
+    );
   });
 });
 
