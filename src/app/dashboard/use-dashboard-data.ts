@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { type DateRange, type McpResponse } from "../../contracts/mcp-response";
-import { ingestDashboardResponse } from "./dashboard-response";
 import { isJsonObject, optionalString } from "./dashboard-api-client";
+import {
+  DashboardSetupRequiredError,
+  readDashboardStream,
+  type DashboardLoadProgress,
+} from "./dashboard-stream";
 
 interface DashboardDataLoadOptions {
   force?: boolean;
@@ -29,6 +33,8 @@ interface DashboardDataState {
   error: string;
   activeRange: DateRange;
   draftRange: DateRange;
+  /** Progress of the load in flight, or null when nothing is loading. */
+  loadProgress: DashboardLoadProgress | null;
 }
 
 interface DashboardDataActions {
@@ -62,6 +68,8 @@ export function useDashboardData({
   const [blockingLoad, setBlockingLoad] = useState(!initialData);
   const [refreshError, setRefreshError] = useState(false);
   const [error, setError] = useState("");
+  const [loadProgress, setLoadProgress] =
+    useState<DashboardLoadProgress | null>(null);
   const [failedLoad, setFailedLoad] = useState<FailedDashboardLoad | null>(
     null,
   );
@@ -84,27 +92,40 @@ export function useDashboardData({
       setRefreshError(false);
       setError("");
       setFailedLoad(null);
+      setLoadProgress({
+        completed: 0,
+        total: 1,
+        label: "Starting",
+        detail: "Connecting to Cursor",
+        receivedAt: Date.now(),
+      });
       try {
         const query = new URLSearchParams({
           ...range,
           ...(options.force ? { refresh: "1" } : {}),
         });
-        const response = await fetch(`/api/mcp?${query}`, {
+        const response = await fetch(`/api/mcp/stream?${query}`, {
+          cache: "no-store",
           signal: controller.signal,
         });
-        const body: unknown = await response.json();
-        const errorBody = isJsonObject(body) ? body : {};
-        if (loadRequestRef.current?.id !== requestId) return;
-        if (response.status === 428 && errorBody.code === "SETUP_REQUIRED") {
-          onSetupRequired?.();
-          return;
-        }
         if (!response.ok) {
+          const body: unknown = await response.json().catch(() => null);
+          const errorBody = isJsonObject(body) ? body : {};
+          if (loadRequestRef.current?.id !== requestId) return;
+          if (response.status === 428 && errorBody.code === "SETUP_REQUIRED") {
+            onSetupRequired?.();
+            return;
+          }
           throw new Error(
             optionalString(errorBody.error) || "Could not load MCP analytics.",
           );
         }
-        const payload = ingestDashboardResponse(body);
+        const payload = await readDashboardStream(response.body, (progress) => {
+          if (loadRequestRef.current?.id === requestId) {
+            setLoadProgress({ ...progress, receivedAt: Date.now() });
+          }
+        });
+        if (loadRequestRef.current?.id !== requestId) return;
         startTransition(() => {
           setData(payload);
           if (!options.preserveActiveRange) {
@@ -118,6 +139,10 @@ export function useDashboardData({
           controller.signal.aborted ||
           loadRequestRef.current?.id !== requestId
         ) {
+          return;
+        }
+        if (loadError instanceof DashboardSetupRequiredError) {
+          onSetupRequired?.();
           return;
         }
         setError(
@@ -135,6 +160,7 @@ export function useDashboardData({
           loadRequestRef.current = null;
           setLoading(false);
           setBlockingLoad(false);
+          setLoadProgress(null);
         }
       }
     },
@@ -165,6 +191,7 @@ export function useDashboardData({
         nextLoadRequestIdRef.current += 1;
         setLoading(false);
         setBlockingLoad(false);
+        setLoadProgress(null);
         setRefreshError(false);
         setError("");
         setFailedLoad(null);
@@ -225,6 +252,7 @@ export function useDashboardData({
       error,
       activeRange,
       draftRange,
+      loadProgress,
     },
     actions: {
       loadData,

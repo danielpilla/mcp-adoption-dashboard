@@ -22,6 +22,7 @@ import { DashboardScopeBar } from "../scope/dashboard-scope-bar";
 import { DashboardAnalysis } from "./dashboard-analysis";
 import { DashboardHeader } from "./dashboard-header";
 import { DashboardNotices } from "./dashboard-notices";
+import { LoadProgressPanel } from "./load-progress-panel";
 import { DashboardOverview, type DashboardKpiView } from "./dashboard-overview";
 import { DashboardPhaseHeader } from "./dashboard-phase-header";
 import { DrawerScopePanel } from "../scope/drawer-scope-panel";
@@ -137,6 +138,7 @@ export function App({
       error,
       activeRange,
       draftRange,
+      loadProgress,
     },
     actions: {
       loadData,
@@ -656,6 +658,29 @@ export function App({
           </section>
         )}
 
+        {loading && !blockingLoad && loadProgress && data && (
+          <section
+            className="state-card reload-notice"
+            aria-labelledby="reload-notice-title"
+          >
+            <div className="state-icon reload-notice-icon" aria-hidden="true">
+              <Icon name="refresh" size={17} />
+            </div>
+            <div className="reload-notice-copy">
+              <h2 id="reload-notice-title">Refreshing MCP activity</h2>
+              <p>
+                The dashboard stays usable and updates when loading finishes.
+              </p>
+            </div>
+            <LoadProgressPanel
+              progress={loadProgress}
+              variant="compact"
+              showDirectory={false}
+              showTitle={false}
+            />
+          </section>
+        )}
+
         <DashboardNotices
           notices={notices}
           directory={directoryProgress}
@@ -951,14 +976,23 @@ export function App({
               Loading {loadingDays} days of activity
               {loadingWindows > 1 ? ` in ${loadingWindows} date ranges` : ""}.
             </p>
-            <div
-              className="loading-progress"
-              role="status"
-              aria-live="polite"
-              aria-label="Loading MCP analytics"
-            >
-              <i />
-            </div>
+            {loadProgress ? (
+              <LoadProgressPanel
+                progress={loadProgress}
+                variant="compact"
+                showDirectory={false}
+                showTitle={false}
+              />
+            ) : (
+              <div
+                className="loading-progress"
+                role="status"
+                aria-live="polite"
+                aria-label="Loading MCP analytics"
+              >
+                <i />
+              </div>
+            )}
           </div>
         </div>
       )}

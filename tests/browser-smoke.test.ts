@@ -241,6 +241,34 @@ try {
   });
   await page.getByLabel("Team Admin API key").fill("smoke-test-only");
   await page.getByRole("button", { name: "Connect dashboard" }).click();
+  await page.getByRole("heading", { name: "Pick a starting range" }).waitFor();
+  const presetCards = page.locator(".range-card");
+  if ((await presetCards.count()) !== 5) {
+    throw new Error("The startup range step did not show five presets");
+  }
+  const checkedPreset = await page
+    .locator(".range-presets input:checked")
+    .getAttribute("value");
+  if (checkedPreset !== "90") {
+    throw new Error(`Default startup preset was ${checkedPreset}, not 90`);
+  }
+  await page.locator(".range-custom input").first().fill(daysAgo(400));
+  await page
+    .getByText("Ranges are limited to 366 days; this one is 401.")
+    .waitFor();
+  if (!(await page.locator(".range-submit").isDisabled())) {
+    throw new Error("An invalid custom range could be submitted");
+  }
+  await page.locator(".range-card").filter({ hasText: "Last quarter" }).click();
+  await page.screenshot({
+    path: "artifacts/mcp-dashboard-range.png",
+    fullPage: true,
+  });
+  const savedRange = page.waitForResponse((response) =>
+    response.url().endsWith("/api/setup/range"),
+  );
+  await page.getByRole("button", { name: "Load 90 days" }).click();
+  await savedRange;
   await page.getByRole("heading", { name: "Loading dashboard" }).waitFor();
   await page.waitForFunction(() => {
     const value = document
@@ -385,11 +413,11 @@ try {
   );
   await page.getByLabel("Start date").fill(daysAgo(120));
   await page.locator(".loading-layer").waitFor({ state: "visible" });
-  const failedRange = await failedRangeResponse;
+  await failedRangeResponse;
+  await page.getByRole("button", { name: "Try again" }).waitFor();
   rejectAnalyticsRequests = false;
   await page.locator(".loading-layer").waitFor({ state: "hidden" });
   if (
-    failedRange.status() !== 502 ||
     (await page.getByLabel("Start date").inputValue()) !==
       activeRangeBeforeFailure.start ||
     (await page.getByLabel("End date").inputValue()) !==

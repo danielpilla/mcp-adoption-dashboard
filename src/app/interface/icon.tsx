@@ -2,7 +2,10 @@ import type { ReactNode } from "react";
 
 type IconName =
   | "activity"
+  | "arrow"
+  | "bolt"
   | "calendar"
+  | "check"
   | "chevron"
   | "close"
   | "download"
@@ -20,12 +23,15 @@ type IconName =
 
 const paths: Record<IconName, ReactNode> = {
   activity: <path d="M3 12h4l2.5-7 5 14 2.5-7h4" />,
+  arrow: <path d="M5 12h14m-5-5 5 5-5 5" />,
+  bolt: <path d="M13 2 4 14h7l-1 8 9-12h-7z" />,
   calendar: (
     <>
       <rect x="3" y="5" width="18" height="16" rx="2" />
       <path d="M16 3v4M8 3v4M3 10h18" />
     </>
   ),
+  check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
   chevron: <path d="m9 18 6-6-6-6" />,
   close: <path d="m6 6 12 12M18 6 6 18" />,
   download: (

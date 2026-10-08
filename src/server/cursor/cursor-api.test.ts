@@ -3,6 +3,7 @@ import {
   CursorApiClient,
   DEFAULT_CURSOR_API_LIMITS,
   retryDelayMilliseconds,
+  type McpFetchProgress,
 } from "./cursor-api";
 
 function jsonResponse(body: unknown, status = 200, headers?: HeadersInit) {
@@ -454,12 +455,144 @@ describe("CursorApiClient", () => {
     expect(urls[0]).toContain("startDate=2026-08-20&endDate=2026-09-18");
     expect(urls[1]).toContain("startDate=2026-07-21&endDate=2026-08-19");
     expect(urls[2]).toContain("startDate=2026-06-21&endDate=2026-07-20");
-    expect(onProgress.mock.calls.map(([progress]) => progress)).toEqual([
+    const windowCounts = onProgress.mock.calls
+      .map(([progress]) => progress as McpFetchProgress)
+      .map(({ completedWindows, totalWindows }) => ({
+        completedWindows,
+        totalWindows,
+      }))
+      .filter(
+        (counts, index, all) =>
+          index === 0 ||
+          counts.completedWindows !== all[index - 1]?.completedWindows,
+      );
+    expect(windowCounts).toEqual([
       { completedWindows: 0, totalWindows: 3 },
       { completedWindows: 1, totalWindows: 3 },
       { completedWindows: 2, totalWindows: 3 },
       { completedWindows: 3, totalWindows: 3 },
     ]);
+    expect(onProgress).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        totalDays: 90,
+        fetchedDays: 90,
+        records: 0,
+        activeWindows: [],
+      }),
+    );
+  });
+
+  it("reports page, day, and record progress for running windows", async () => {
+    const page = (day: string, usage: number, hasNextPage: boolean) =>
+      jsonResponse({
+        data: {
+          "user-1@example.com": [
+            {
+              event_date: day,
+              tool_name: "search",
+              mcp_server_name: "github",
+              usage,
+            },
+          ],
+        },
+        pagination: { totalPages: 2, hasNextPage },
+      });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(page("2026-09-01", 3, true))
+      .mockResolvedValueOnce(page("2026-09-02", 5, false));
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+    );
+    const onProgress = vi.fn<(progress: McpFetchProgress) => void>();
+
+    await client.fetchMcp("2026-09-01", "2026-09-10", new Map(), onProgress);
+
+    const updates = onProgress.mock.calls.map(([progress]) => progress);
+    expect(updates[0]).toMatchObject({
+      completedWindows: 0,
+      totalWindows: 1,
+      totalDays: 10,
+      fetchedDays: 0,
+      records: 0,
+      activeWindows: [],
+    });
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        records: 1,
+        fetchedDays: 0,
+        activeWindows: [
+          {
+            startDate: "2026-09-01",
+            endDate: "2026-09-10",
+            days: 10,
+            pagesLoaded: 1,
+            totalPages: 2,
+          },
+        ],
+      }),
+    );
+    expect(updates.at(-1)).toMatchObject({
+      completedWindows: 1,
+      fetchedDays: 10,
+      records: 2,
+      activeWindows: [],
+    });
+    expect(updates.every((update) => update.retry === undefined)).toBe(true);
+    expect(
+      updates.every((update) => typeof update.lastActivityAt === "number"),
+    ).toBe(true);
+  });
+
+  it.each([
+    [
+      "rate limits",
+      () => jsonResponse({ error: "slow down" }, 429, { "retry-after": "2" }),
+      { reason: "rate_limited", status: 429, delayMs: 2000 },
+    ],
+    [
+      "server errors",
+      () => jsonResponse({ error: "temporary" }, 503),
+      { reason: "server_error", status: 503, delayMs: 500 },
+    ],
+    [
+      "network errors",
+      () => Promise.reject(new TypeError("socket closed")),
+      { reason: "network_error", delayMs: 250 },
+    ],
+  ])("reports retry waits after %s", async (_name, failure, expected) => {
+    const sleep = vi.fn(async () => undefined);
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(async () => failure())
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {},
+          pagination: { totalPages: 1, hasNextPage: false },
+        }),
+      );
+    const client = new CursorApiClient(
+      "test-key",
+      "https://example.test",
+      fetcher,
+      sleep,
+    );
+    const onProgress = vi.fn<(progress: McpFetchProgress) => void>();
+
+    await client.fetchMcp("2026-09-01", "2026-09-10", new Map(), onProgress);
+
+    const updates = onProgress.mock.calls.map(([progress]) => progress);
+    const waiting = updates.find((update) => update.retry);
+    expect(waiting?.retry).toEqual({
+      attempt: 2,
+      maxAttempts: 5,
+      startedAt: expect.any(Number),
+      ...expected,
+    });
+    expect(waiting?.activeWindows).toHaveLength(1);
+    expect(updates.at(-1)?.retry).toBeUndefined();
   });
 
   it("limits concurrent date-window requests", async () => {

@@ -30,12 +30,42 @@ startup validation was deferred can temporarily produce `configured: true` on
 ### `GET /api/setup/status`
 
 Returns whether an API key is configured, whether browser setup is allowed,
-and the length in days of the range the dashboard loads first
-(`DEFAULT_RANGE_DAYS`, default `90`):
+the range in days pre-selected at startup when none is remembered
+(`DEFAULT_RANGE_DAYS`, default `90`), the remembered startup range, and the
+coverage of the per-day activity cache:
 
 ```json
-{ "configured": true, "setupAllowed": true, "defaultRangeDays": 90 }
+{
+  "configured": true,
+  "setupAllowed": true,
+  "defaultRangeDays": 90,
+  "rangePreference": { "kind": "preset", "days": 180 },
+  "cacheCoverage": {
+    "firstDate": "2026-03-01",
+    "lastDate": "2026-09-17",
+    "days": 201,
+    "cacheableThrough": "2026-09-17",
+    "spans": [{ "startDate": "2026-03-01", "endDate": "2026-09-17" }]
+  }
+}
 ```
+
+`rangePreference` is `{ "kind": "preset", "days": n }` (a rolling range ending
+today), `{ "kind": "custom", "startDate": "...", "endDate": "..." }`, or `null`
+when nothing is remembered or it cannot be read. `cacheCoverage` is computed
+from the cache index without reading any day file; it is `null` when the server
+has no day cache. `spans` lists contiguous cached days, oldest first, and keeps
+only the newest 400 runs. `cacheableThrough` is the newest day that can be
+cached; later days are always refetched.
+
+### `PUT /api/setup/range`
+
+Remembers the startup range. The body is a `rangePreference` value: a preset of
+1 to 366 days or a custom range of at most 366 days. Unknown fields are
+dropped. Returns HTTP 200 with `{ "rangePreference": ... }`, HTTP 400 for an
+invalid range, or HTTP 503 when the server cannot store it. The range is
+written atomically, with owner-only permissions, to `startup-range.json` in
+`MCP_CACHE_DIR`.
 
 ### `POST /api/setup`
 
@@ -99,8 +129,21 @@ Uses the same range parameters and result contract. The response content type
 is `application/x-ndjson` with one JSON object per line:
 
 - `{ "type": "progress", ... }`: numeric `completed` and `total`, plus `label`,
-  `detail`, and `directory` (`status`, `completedGroups`, and `totalGroups`,
-  which is `null` until known)
+  `detail`, `directory` (`status`, `completedGroups`, and `totalGroups`,
+  which is `null` until known), and `activity`:
+  - `state`: `loading`, `reused` (a settled result is reused), or `ready`
+  - `totalDays`, `cachedDays`, and `fetchedDays`: days in the range, days
+    served from the day cache, and days in fetch windows that finished
+  - `records`: activity rows loaded so far
+  - `completedWindows` and `totalWindows`: 30-day fetch windows
+  - `windows`: running windows, newest first, each with `startDate`,
+    `endDate`, `days`, `pagesLoaded`, and `totalPages` (`null` until known)
+  - `retry`: `null`, or `attempt`, `maxAttempts`, `delayMs`, `waitedMs`,
+    `reason` (`rate_limited`, `server_error`, or `network_error`), and
+    `status` (`null` after a network error) while a request waits to be
+    retried
+  - `elapsedMs` since the load started, and `idleMs` since the last page or
+    window finished
 - `{ "type": "records", "records": [...] }`: a batch of up to 5,000 activity
   records, in ascending date order
 - `{ "type": "data", "data": ... }`: the final analytics response without

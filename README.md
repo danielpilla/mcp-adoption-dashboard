@@ -60,16 +60,16 @@ inspection may expose it. For non-interactive deployments, provide
 The server loads `.env` when present. [`.env.example`](.env.example) is the
 complete application configuration reference.
 
-| Variable                        | Type                  | Default     | Required                  | Purpose                                                                                               |
-| ------------------------------- | --------------------- | ----------- | ------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `CURSOR_API_KEY`                | string                | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                                                          |
-| `CURSOR_TEAM_NAME`              | string                | empty       | No                        | Display label because the API returns a team ID, not its display name.                                |
-| `PORT`                          | integer               | `5173`      | No                        | Vite development UI port.                                                                             |
-| `SERVER_PORT`                   | integer               | `4173`      | No                        | API and production application port.                                                                  |
-| `BIND_HOST`                     | hostname or IP        | `127.0.0.1` | No                        | Network interface used by development and production servers.                                         |
-| `ALLOW_UNAUTHENTICATED_NETWORK` | literal `1`           | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control.                             |
-| `INTERNAL_MCP_SERVERS`          | comma-separated       | empty       | No                        | Additional organization-specific MCP labels classified as internal.                                   |
-| `DEFAULT_RANGE_DAYS`            | integer from 1 to 366 | `90`        | No                        | Length in days of the range the dashboard loads first. An invalid value logs a warning and uses `90`. |
+| Variable                        | Type                  | Default     | Required                  | Purpose                                                                                                           |
+| ------------------------------- | --------------------- | ----------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `CURSOR_API_KEY`                | string                | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                                                                      |
+| `CURSOR_TEAM_NAME`              | string                | empty       | No                        | Display label because the API returns a team ID, not its display name.                                            |
+| `PORT`                          | integer               | `5173`      | No                        | Vite development UI port.                                                                                         |
+| `SERVER_PORT`                   | integer               | `4173`      | No                        | API and production application port.                                                                              |
+| `BIND_HOST`                     | hostname or IP        | `127.0.0.1` | No                        | Network interface used by development and production servers.                                                     |
+| `ALLOW_UNAUTHENTICATED_NETWORK` | literal `1`           | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control.                                         |
+| `INTERNAL_MCP_SERVERS`          | comma-separated       | empty       | No                        | Additional organization-specific MCP labels classified as internal.                                               |
+| `DEFAULT_RANGE_DAYS`            | integer from 1 to 366 | `90`        | No                        | Range in days pre-selected at startup when no range is remembered. An invalid value logs a warning and uses `90`. |
 
 ### Optional caps and timeouts
 
@@ -105,8 +105,9 @@ application configuration.
 
 ### Typical workflow
 
-1. Choose a UTC date preset or custom range. Ranges are inclusive and limited
-   to 366 days.
+1. Pick a starting range: a 7, 30, 90, 180, or 365-day preset, or a custom
+   UTC range. Ranges are inclusive and limited to 366 days. Later, switch
+   ranges from the dashboard header.
 2. Narrow the in-memory dataset by user, MCP, tool, MCP type, directory group,
    or calendar grain.
 3. Compare KPIs and trends, inspect user–MCP relationships, or configure a
@@ -118,6 +119,16 @@ The Refresh action bypasses the 12-hour settled-result cache. Repeated refreshes
 of the same range within 10 seconds return HTTP 429. Completed days older than
 the refetch window are kept in the per-day activity cache, so a refresh or a
 later range fetches only the days that are not cached yet.
+
+At startup the dashboard shows which presets the per-day cache already holds
+and pre-selects the largest fully cached one, or `DEFAULT_RANGE_DAYS` when
+nothing is cached. The choice is remembered in `startup-range.json` inside
+`MCP_CACHE_DIR` (and in the browser when the server cannot store it). When the
+remembered range already has cached days, it loads at once; **Change range** on
+the loading screen returns to the picker. The loading screen and the notice
+shown while a reload runs report days from the cache and fetched, the current
+30-day window, rows loaded, elapsed time, an estimate of the time remaining,
+and retry or slow states.
 
 Directory groups load in the background after the API key is validated. The
 dashboard opens without waiting; names, roles, and group filters appear when
@@ -264,7 +275,8 @@ an access-control mechanism.
 - **The dashboard shows partial data:** the notice names the cap that was
   reached. Raise that setting, or choose the shorter range the notice suggests.
 - **The activity cache should be rebuilt:** stop the server and delete
-  `MCP_CACHE_DIR`. Changing the API key clears it automatically.
+  `MCP_CACHE_DIR`. Changing the API key clears the cached days automatically.
+  Deleting the directory also forgets the remembered startup range.
 
 ## License
 
