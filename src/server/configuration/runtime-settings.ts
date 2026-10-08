@@ -3,6 +3,10 @@ import {
   type CursorApiLimits,
 } from "../cursor/cursor-api.js";
 import {
+  DEFAULT_RANGE_DAYS,
+  MAX_DATE_RANGE_DAYS,
+} from "../../contracts/date-range-days.js";
+import {
   parseNonNegativeInteger,
   parsePositiveInteger,
 } from "./server-configuration.js";
@@ -25,6 +29,7 @@ export const DEFAULT_RUNTIME_SETTINGS = {
   mcpCacheDirectory: ".cache/mcp-activity",
   mcpCacheMaxBytes: DEFAULT_CURSOR_API_LIMITS.maxResponseBytes,
   mcpCacheRefetchDays: 2,
+  defaultRangeDays: DEFAULT_RANGE_DAYS,
 } as const;
 
 export interface RuntimeSettings {
@@ -39,6 +44,48 @@ export interface RuntimeSettings {
     maxBytes: number;
     refetchDays: number;
   };
+  /** Inclusive length of the range the dashboard loads first. */
+  defaultRangeDays: number;
+}
+
+export type SettingWarning = (setting: string, reason: string) => void;
+
+const warnInvalidSetting: SettingWarning = (setting, reason) =>
+  console.warn(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "warn",
+      event: "settings.invalid",
+      setting,
+      reason,
+    }),
+  );
+
+/**
+ * Reads DEFAULT_RANGE_DAYS. This setting only changes the first range the
+ * dashboard loads, so an invalid value falls back to the default with a
+ * warning instead of stopping the server.
+ */
+export function parseDefaultRangeDays(
+  value: string | undefined,
+  warn: SettingWarning = warnInvalidSetting,
+): number {
+  const raw = value?.trim();
+  if (!raw) return DEFAULT_RUNTIME_SETTINGS.defaultRangeDays;
+  const parsed = Number(raw);
+  if (
+    /^\d+$/.test(raw) &&
+    Number.isSafeInteger(parsed) &&
+    parsed >= 1 &&
+    parsed <= MAX_DATE_RANGE_DAYS
+  ) {
+    return parsed;
+  }
+  warn(
+    "DEFAULT_RANGE_DAYS",
+    `DEFAULT_RANGE_DAYS must be an integer from 1 to ${MAX_DATE_RANGE_DAYS}; using ${DEFAULT_RUNTIME_SETTINGS.defaultRangeDays}.`,
+  );
+  return DEFAULT_RUNTIME_SETTINGS.defaultRangeDays;
 }
 
 function parseTimeout(
@@ -55,6 +102,7 @@ function parseTimeout(
 
 export function readRuntimeSettings(
   env: Record<string, string | undefined>,
+  warn: SettingWarning = warnInvalidSetting,
 ): RuntimeSettings {
   const limit = (name: string, fallback: number) =>
     parsePositiveInteger(env[name], fallback, name);
@@ -117,5 +165,6 @@ export function readRuntimeSettings(
         "MCP_CACHE_REFETCH_DAYS",
       ),
     },
+    defaultRangeDays: parseDefaultRangeDays(env.DEFAULT_RANGE_DAYS, warn),
   };
 }

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { readRuntimeSettings } from "./runtime-settings";
+import { describe, expect, it, vi } from "vitest";
+import { parseDefaultRangeDays, readRuntimeSettings } from "./runtime-settings";
 
 describe("runtime settings", () => {
   it("defaults every cap high enough for 100 million records", () => {
@@ -21,6 +21,7 @@ describe("runtime settings", () => {
         maxBytes: 25_600_000_000,
         refetchDays: 2,
       },
+      defaultRangeDays: 90,
     });
   });
 
@@ -40,6 +41,7 @@ describe("runtime settings", () => {
         MCP_CACHE_DIR: " /tmp/mcp-cache ",
         MCP_CACHE_MAX_BYTES: "110",
         MCP_CACHE_REFETCH_DAYS: "0",
+        DEFAULT_RANGE_DAYS: "14",
       }),
     ).toEqual({
       cursorApiLimits: {
@@ -55,6 +57,7 @@ describe("runtime settings", () => {
       analyticsTimeoutMs: 90,
       directoryTimeoutMs: 100,
       mcpCache: { directory: "/tmp/mcp-cache", maxBytes: 110, refetchDays: 0 },
+      defaultRangeDays: 14,
     });
   });
 
@@ -76,5 +79,70 @@ describe("runtime settings", () => {
     ],
   ])("rejects an invalid %s", (name, value, message) => {
     expect(() => readRuntimeSettings({ [name]: value })).toThrow(message);
+  });
+
+  describe("DEFAULT_RANGE_DAYS", () => {
+    it.each([
+      [undefined, 90],
+      ["", 90],
+      ["   ", 90],
+    ])("defaults to 90 days for %j without a warning", (value, expected) => {
+      const warn = vi.fn();
+      expect(parseDefaultRangeDays(value, warn)).toBe(expected);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["1", 1],
+      ["14", 14],
+      [" 30 ", 30],
+      ["366", 366],
+    ])("accepts %j", (value, expected) => {
+      const warn = vi.fn();
+      expect(parseDefaultRangeDays(value, warn)).toBe(expected);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it.each(["0", "367", "100000000000000000000", "-7", "abc", "14.5", "1e2"])(
+      "falls back to 90 days with a warning for %j",
+      (value) => {
+        const warn = vi.fn();
+        expect(parseDefaultRangeDays(value, warn)).toBe(90);
+        expect(warn).toHaveBeenCalledWith(
+          "DEFAULT_RANGE_DAYS",
+          "DEFAULT_RANGE_DAYS must be an integer from 1 to 366; using 90.",
+        );
+      },
+    );
+
+    it("keeps reading the other settings when the value is invalid", () => {
+      const warn = vi.fn();
+      const settings = readRuntimeSettings(
+        { DEFAULT_RANGE_DAYS: "not-a-number", MAX_MCP_RECORDS: "10" },
+        warn,
+      );
+      expect(settings.defaultRangeDays).toBe(90);
+      expect(settings.cursorApiLimits.maxRecords).toBe(10);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("writes a structured warning by default", () => {
+      const consoleWarn = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => undefined);
+      try {
+        expect(parseDefaultRangeDays("0")).toBe(90);
+        expect(consoleWarn).toHaveBeenCalledTimes(1);
+        expect(
+          JSON.parse(String(consoleWarn.mock.calls[0]?.[0])),
+        ).toMatchObject({
+          level: "warn",
+          event: "settings.invalid",
+          setting: "DEFAULT_RANGE_DAYS",
+        });
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
   });
 });

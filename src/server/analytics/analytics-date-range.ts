@@ -1,8 +1,9 @@
+import { MAX_DATE_RANGE_DAYS } from "../../contracts/date-range-days.js";
+
+export { MAX_DATE_RANGE_DAYS };
+
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1_000;
-
-// Inclusive ranges are capped to one leap year to bound upstream work.
-export const MAX_DATE_RANGE_DAYS = 366;
 
 function parseIsoDate(value: unknown, field: string): Date {
   if (typeof value !== "string" || !ISO_DATE.test(value)) {

@@ -71,6 +71,8 @@ interface AppOptions {
   activityStore?: ActivityStore;
   loopbackOnly?: boolean;
   shutdownSignal?: AbortSignal;
+  /** Inclusive length of the range the dashboard loads first. */
+  defaultRangeDays?: number;
 }
 
 interface AnalyticsCacheEntry {
@@ -277,6 +279,7 @@ export function createApp({
   activityStore,
   loopbackOnly,
   shutdownSignal,
+  defaultRangeDays = DEFAULT_RUNTIME_SETTINGS.defaultRangeDays,
 }: AppOptions) {
   const app = express();
   let activeClient = initialClient ?? null;
@@ -694,6 +697,7 @@ export function createApp({
     response.json({
       configured: Boolean(activeClient),
       setupAllowed: Boolean(setup?.allowed),
+      defaultRangeDays,
     });
   });
 

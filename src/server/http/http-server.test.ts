@@ -1312,6 +1312,23 @@ describe("dashboard setup endpoint", () => {
     expect(logged).not.toContain("validation failed");
   });
 
+  it("reports the configured default range in setup status", async () => {
+    const baseUrl = await listen(
+      createApp({
+        setup: { allowed: false, configure: vi.fn() },
+        loadTeamMetadata: false,
+        defaultRangeDays: 14,
+      }),
+    );
+
+    const status = await fetch(`${baseUrl}/api/setup/status`);
+    expect(await status.json()).toEqual({
+      configured: false,
+      setupAllowed: false,
+      defaultRangeDays: 14,
+    });
+  });
+
   it("reports setup mode and configures the dashboard once", async () => {
     const configuredClient = new CursorApiClient("new-key");
     vi.spyOn(configuredClient, "fetchMcp").mockResolvedValue(
@@ -1329,6 +1346,7 @@ describe("dashboard setup endpoint", () => {
     expect(await initialStatus.json()).toEqual({
       configured: false,
       setupAllowed: true,
+      defaultRangeDays: 90,
     });
 
     const blockedAnalytics = await fetch(
@@ -1351,6 +1369,7 @@ describe("dashboard setup endpoint", () => {
     expect(await configuredStatus.json()).toEqual({
       configured: true,
       setupAllowed: true,
+      defaultRangeDays: 90,
     });
 
     const analytics = await fetch(
