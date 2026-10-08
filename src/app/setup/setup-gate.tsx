@@ -6,9 +6,20 @@ import {
   type FormEvent,
 } from "react";
 import type { McpResponse } from "../../contracts/mcp-response";
+import {
+  parseCacheCoverage,
+  parseStartupRange,
+  type CacheCoverage,
+  type StartupRange,
+} from "../../contracts/startup-range";
 import { App } from "../dashboard/dashboard-application";
 import { DEFAULT_RANGE_DAYS } from "../../contracts/date-range-days";
-import { initialRangeDays, presetRange } from "../dashboard/dashboard-dates";
+import {
+  inclusiveDayCount,
+  initialRangeDays,
+  isoDate,
+  rangeLabel,
+} from "../dashboard/dashboard-dates";
 import {
   DashboardSetupRequiredError,
   readDashboardStream,
@@ -18,21 +29,28 @@ import {
   optionalString,
   readJsonObject,
 } from "../dashboard/dashboard-api-client";
-import {
-  describeDirectoryProgress,
-  directoryProgressRatio,
-} from "../dashboard/directory-progress";
+import { LoadProgressPanel } from "../dashboard/load-progress-panel";
 import { Icon } from "../interface/icon";
 import { useDialogFocusTrap } from "../interface/dialog-focus-trap";
+import {
+  planStartup,
+  readLocalStartupRange,
+  resolveStartupRange,
+  saveStartupRange,
+} from "./range-choice";
+import { RangeStep } from "./range-step";
 
 type SetupStatus = {
   configured: boolean;
   setupAllowed: boolean;
   defaultRangeDays: number;
+  rangePreference: StartupRange | null;
+  cacheCoverage: CacheCoverage | null;
 };
 
 type SetupView =
   | "checking"
+  | "choose-range"
   | "loading"
   | "revealing"
   | "configured"
@@ -40,25 +58,33 @@ type SetupView =
   | "blocked"
   | "error";
 
-function DirectoryProgressRow({
-  progress,
-}: {
-  progress: NonNullable<DashboardLoadProgress["directory"]>;
-}) {
-  const ratio = directoryProgressRatio(progress);
-  return (
-    <div className="setup-directory-progress">
-      <div>
-        <strong>Directory groups</strong>
-        <small>
-          {describeDirectoryProgress(progress)}
-          {progress.status === "loading" &&
-            " · loads in the background; the dashboard opens without waiting"}
-        </small>
-      </div>
-      {ratio !== null && <b>{Math.round(ratio * 100)}%</b>}
-    </div>
-  );
+const STARTING_PROGRESS: DashboardLoadProgress = {
+  completed: 0,
+  total: 1,
+  label: "Starting",
+  detail: "Connecting to Cursor",
+};
+
+function todayIso(): string {
+  return isoDate(new Date());
+}
+
+function readSetupStatus(body: Record<string, unknown>): SetupStatus {
+  if (
+    typeof body.configured !== "boolean" ||
+    typeof body.setupAllowed !== "boolean"
+  ) {
+    throw new Error("The local server returned invalid setup status.");
+  }
+  return {
+    configured: body.configured,
+    setupAllowed: body.setupAllowed,
+    defaultRangeDays: initialRangeDays(body.defaultRangeDays),
+    // Servers without stored preferences fall back to this browser's copy.
+    rangePreference:
+      parseStartupRange(body.rangePreference) ?? readLocalStartupRange(),
+    cacheCoverage: parseCacheCoverage(body.cacheCoverage),
+  };
 }
 
 export function SetupGate({
@@ -74,37 +100,37 @@ export function SetupGate({
   const [showKey, setShowKey] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [rangeDays, setRangeDays] = useState(DEFAULT_RANGE_DAYS);
-  const [loadProgress, setLoadProgress] = useState<DashboardLoadProgress>({
-    completed: 0,
-    total: 1,
-    label: "Starting",
-    detail: "Connecting to Cursor",
+  const [status, setStatus] = useState<SetupStatus | null>(null);
+  const [selection, setSelection] = useState<StartupRange>({
+    kind: "preset",
+    days: DEFAULT_RANGE_DAYS,
   });
+  const [loadProgress, setLoadProgress] =
+    useState<DashboardLoadProgress>(STARTING_PROGRESS);
   const checkedStatus = useRef(false);
+  const loadController = useRef<AbortController | null>(null);
   const setupDialogRef = useDialogFocusTrap<HTMLElement>(
     view !== "configured",
     view,
   );
 
-  const loadDashboard = useCallback(async (days: number) => {
-    setRangeDays(days);
+  const loadDashboard = useCallback(async (range: StartupRange) => {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    setSelection(range);
     setView("loading");
     setError("");
-    setLoadProgress({
-      completed: 0,
-      total: 1,
-      label: "Starting",
-      detail: "Connecting to Cursor",
-    });
+    setLoadProgress({ ...STARTING_PROGRESS, receivedAt: Date.now() });
     try {
-      const range = presetRange(days);
+      const dates = resolveStartupRange(range, todayIso());
       const query = new URLSearchParams({
-        startDate: range.startDate,
-        endDate: range.endDate,
+        startDate: dates.startDate,
+        endDate: dates.endDate,
       });
       const response = await fetch(`/api/mcp/stream?${query}`, {
         cache: "no-store",
+        signal: controller.signal,
       });
       if (!response.ok) {
         const body = await readJsonObject(response, "error response");
@@ -120,10 +146,10 @@ export function SetupGate({
         }
         throw new Error(responseError || "Could not load MCP analytics.");
       }
-      const loadedData = await readDashboardStream(
-        response.body,
-        setLoadProgress,
+      const loadedData = await readDashboardStream(response.body, (progress) =>
+        setLoadProgress({ ...progress, receivedAt: Date.now() }),
       );
+      if (controller.signal.aborted) return;
 
       const reduceMotion = window.matchMedia(
         "(prefers-reduced-motion: reduce)",
@@ -131,6 +157,7 @@ export function SetupGate({
       if (!reduceMotion) {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
       }
+      if (controller.signal.aborted) return;
       setDashboardData(loadedData);
       setView("revealing");
       if (!reduceMotion) {
@@ -138,6 +165,7 @@ export function SetupGate({
       }
       setView("configured");
     } catch (loadError) {
+      if (controller.signal.aborted) return;
       if (loadError instanceof DashboardSetupRequiredError) {
         setDashboardData(null);
         setError(
@@ -153,7 +181,41 @@ export function SetupGate({
           : "Could not load the dashboard.",
       );
       setView("error");
+    } finally {
+      if (loadController.current === controller) loadController.current = null;
     }
+  }, []);
+
+  useEffect(() => () => loadController.current?.abort(), []);
+
+  const startFromStatus = useCallback(
+    async (nextStatus: SetupStatus) => {
+      setStatus(nextStatus);
+      if (!nextStatus.configured) {
+        setSelection({ kind: "preset", days: nextStatus.defaultRangeDays });
+        setView(nextStatus.setupAllowed ? "required" : "blocked");
+        return;
+      }
+      const plan = planStartup({
+        remembered: nextStatus.rangePreference,
+        coverage: nextStatus.cacheCoverage,
+        defaultRangeDays: nextStatus.defaultRangeDays,
+        today: todayIso(),
+      });
+      setSelection(plan.selection);
+      if (plan.autoLoad) {
+        await loadDashboard(plan.selection);
+      } else {
+        setView("choose-range");
+      }
+    },
+    [loadDashboard],
+  );
+
+  const fetchStatus = useCallback(async () => {
+    const response = await fetch("/api/setup/status", { cache: "no-store" });
+    if (!response.ok) throw new Error("Could not reach the local server.");
+    return readSetupStatus(await readJsonObject(response, "setup status"));
   }, []);
 
   const checkStatus = useCallback(async () => {
@@ -161,26 +223,7 @@ export function SetupGate({
     setView("checking");
     setError("");
     try {
-      const response = await fetch("/api/setup/status", { cache: "no-store" });
-      if (!response.ok) throw new Error("Could not reach the local server.");
-      const body = await readJsonObject(response, "setup status");
-      if (
-        typeof body.configured !== "boolean" ||
-        typeof body.setupAllowed !== "boolean"
-      ) {
-        throw new Error("The local server returned invalid setup status.");
-      }
-      const status: SetupStatus = {
-        configured: body.configured,
-        setupAllowed: body.setupAllowed,
-        defaultRangeDays: initialRangeDays(body.defaultRangeDays),
-      };
-      setRangeDays(status.defaultRangeDays);
-      if (status.configured) {
-        await loadDashboard(status.defaultRangeDays);
-      } else {
-        setView(status.setupAllowed ? "required" : "blocked");
-      }
+      await startFromStatus(await fetchStatus());
     } catch (statusError) {
       setError(
         statusError instanceof Error
@@ -189,7 +232,7 @@ export function SetupGate({
       );
       setView("error");
     }
-  }, [initialData, loadDashboard]);
+  }, [fetchStatus, initialData, startFromStatus]);
 
   useEffect(() => {
     if (checkedStatus.current) return;
@@ -204,6 +247,24 @@ export function SetupGate({
       "The saved Cursor API key is no longer valid. Enter a new key to reconnect.",
     );
     setView("required");
+  }, []);
+
+  const chooseRange = useCallback(
+    (range: StartupRange) => {
+      void saveStartupRange(range);
+      setStatus((current) =>
+        current ? { ...current, rangePreference: range } : current,
+      );
+      void loadDashboard(range);
+    },
+    [loadDashboard],
+  );
+
+  const changeRange = useCallback(() => {
+    loadController.current?.abort();
+    loadController.current = null;
+    setError("");
+    setView("choose-range");
   }, []);
 
   const submit = async (event: FormEvent) => {
@@ -227,7 +288,21 @@ export function SetupGate({
         );
       }
       setApiKey("");
-      await loadDashboard(rangeDays);
+      let nextStatus: SetupStatus;
+      try {
+        nextStatus = await fetchStatus();
+      } catch {
+        nextStatus = {
+          ...(status ?? {
+            setupAllowed: true,
+            defaultRangeDays: DEFAULT_RANGE_DAYS,
+            rangePreference: readLocalStartupRange(),
+            cacheCoverage: null,
+          }),
+          configured: true,
+        };
+      }
+      await startFromStatus({ ...nextStatus, configured: true });
     } catch (setupError) {
       setError(
         setupError instanceof Error
@@ -238,6 +313,12 @@ export function SetupGate({
       setSubmitting(false);
     }
   };
+
+  const today = todayIso();
+  const selectedDates = resolveStartupRange(selection, today);
+  const rangeDays = inclusiveDayCount(selectedDates);
+  const loadingView = view === "loading" || view === "revealing";
+  const wide = view === "choose-range" || loadingView;
 
   return (
     <>
@@ -281,7 +362,7 @@ export function SetupGate({
           <div className="setup-scrim" />
           <section
             ref={setupDialogRef}
-            className="setup-modal"
+            className={`setup-modal${wide ? " is-wide" : ""} view-${view}`}
             role="dialog"
             tabIndex={-1}
             aria-modal="true"
@@ -292,38 +373,73 @@ export function SetupGate({
                 <Icon name="network" size={23} />
               </span>
               <span>Cursor MCP Adoption</span>
+              {view === "choose-range" && (
+                <span className="setup-modal-step">Startup range</span>
+              )}
             </div>
 
-            <div className="setup-modal-copy">
+            <div className="setup-modal-copy" key={`copy-${view}`}>
               <span className="eyebrow">
-                {view === "loading" || view === "revealing"
+                {loadingView
                   ? `${rangeDays}-day view`
-                  : "Local setup"}
+                  : view === "choose-range"
+                    ? "Choose what to load"
+                    : "Local setup"}
               </span>
-              <h1 id="setup-title">
-                {view === "blocked"
-                  ? "Finish setup from the server"
-                  : view === "error"
-                    ? "Dashboard couldn’t load"
-                    : view === "loading" || view === "revealing"
-                      ? "Loading dashboard"
-                      : "Connect Cursor"}
-              </h1>
-              {view !== "loading" && view !== "revealing" && (
+              <div className="setup-modal-title-row">
+                <h1 id="setup-title">
+                  {view === "blocked"
+                    ? "Finish setup from the server"
+                    : view === "error"
+                      ? "Dashboard couldn’t load"
+                      : loadingView
+                        ? "Loading dashboard"
+                        : view === "choose-range"
+                          ? "Pick a starting range"
+                          : "Connect Cursor"}
+                </h1>
+                {view === "loading" && (
+                  <button
+                    type="button"
+                    className="setup-change-range"
+                    onClick={changeRange}
+                  >
+                    <Icon name="calendar" size={14} />
+                    Change range
+                  </button>
+                )}
+              </div>
+              {loadingView ? (
+                <p className="setup-range-line">
+                  {rangeLabel(selectedDates.startDate, selectedDates.endDate)}
+                </p>
+              ) : (
                 <p>
                   {view === "blocked"
                     ? "Browser setup is disabled when the dashboard is exposed beyond loopback."
                     : view === "error"
                       ? error ||
                         "The dashboard could not load its initial data."
-                      : "Enter a Team Admin API key. It will be validated and stored in .env on this machine."}
+                      : view === "choose-range"
+                        ? "Choose how much MCP activity to load first. You can switch ranges any time from the dashboard header."
+                        : "Enter a Team Admin API key. It will be validated and stored in .env on this machine."}
                 </p>
               )}
             </div>
 
+            {view === "choose-range" && (
+              <RangeStep
+                initial={selection}
+                remembered={status?.rangePreference ?? null}
+                coverage={status?.cacheCoverage ?? null}
+                today={today}
+                onConfirm={chooseRange}
+              />
+            )}
+
             {view === "required" && (
               <form
-                className="setup-form"
+                className="setup-form setup-step"
                 onSubmit={(event) => void submit(event)}
               >
                 <label htmlFor="setup-api-key">Team Admin API key</label>
@@ -378,43 +494,13 @@ export function SetupGate({
               </div>
             )}
 
-            {(view === "loading" || view === "revealing") && (
+            {loadingView && (
               <div
-                className="setup-load-progress"
-                role="status"
-                aria-live="polite"
+                className="setup-load-progress setup-step"
+                tabIndex={-1}
+                data-dialog-initial-focus
               >
-                <div className="setup-load-progress-heading">
-                  <div>
-                    <strong>{loadProgress.label}</strong>
-                    <small>{loadProgress.detail}</small>
-                  </div>
-                  <b>
-                    {Math.round(
-                      (loadProgress.completed /
-                        Math.max(loadProgress.total, 1)) *
-                        100,
-                    )}
-                    %
-                  </b>
-                </div>
-                <div
-                  className="setup-load-progress-track"
-                  role="progressbar"
-                  aria-valuemin={0}
-                  aria-valuemax={loadProgress.total}
-                  aria-valuenow={loadProgress.completed}
-                >
-                  <i
-                    style={{
-                      width: `${(loadProgress.completed / Math.max(loadProgress.total, 1)) * 100}%`,
-                    }}
-                  />
-                </div>
-                {loadProgress.directory &&
-                  loadProgress.directory.status !== "disabled" && (
-                    <DirectoryProgressRow progress={loadProgress.directory} />
-                  )}
+                <LoadProgressPanel progress={loadProgress} />
               </div>
             )}
 
@@ -422,9 +508,27 @@ export function SetupGate({
               <div className="setup-recovery">
                 <code>npm run init</code>
                 {view === "error" && (
-                  <button type="button" onClick={() => void checkStatus()}>
-                    Try again
-                  </button>
+                  <span className="setup-recovery-actions">
+                    {status?.configured && (
+                      <button
+                        type="button"
+                        className="is-quiet"
+                        onClick={changeRange}
+                      >
+                        Change range
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void (status?.configured
+                          ? loadDashboard(selection)
+                          : checkStatus())
+                      }
+                    >
+                      Try again
+                    </button>
+                  </span>
                 )}
               </div>
             )}
