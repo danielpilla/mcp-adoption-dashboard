@@ -178,4 +178,109 @@ describe("dashboard stream reader", () => {
       },
     ]);
   });
+
+  it("reports day, record, window, and retry progress", async () => {
+    const activity = {
+      state: "loading",
+      totalDays: 90,
+      cachedDays: 60,
+      fetchedDays: 40,
+      records: 1200,
+      completedWindows: 1,
+      totalWindows: 2,
+      windows: [
+        {
+          startDate: "2026-06-01",
+          endDate: "2026-06-30",
+          days: 30,
+          pagesLoaded: 2,
+          totalPages: null,
+        },
+      ],
+      retry: {
+        attempt: 2,
+        maxAttempts: 5,
+        delayMs: 1000,
+        waitedMs: 200,
+        reason: "network_error",
+        status: null,
+      },
+      elapsedMs: 4000,
+      idleMs: 250,
+    };
+    const observed: unknown[] = [];
+    const body = [
+      {
+        type: "progress",
+        completed: 1,
+        total: 3,
+        label: "MCP activity",
+        detail: "1 / 2",
+        activity,
+      },
+      { type: "data", data: response },
+    ]
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+
+    await readDashboardStream(byteStream(body, 5), (value) =>
+      observed.push(value),
+    );
+
+    expect(observed).toEqual([
+      {
+        completed: 1,
+        total: 3,
+        label: "MCP activity",
+        detail: "1 / 2",
+        // Fetched days never exceed the uncached days.
+        activity: { ...activity, fetchedDays: 30 },
+      },
+    ]);
+  });
+
+  it.each([
+    { state: "paused" },
+    { records: -1 },
+    { windows: "none" },
+    { retry: { attempt: 2 } },
+    { windows: [{ startDate: "June", endDate: "2026-06-30" }] },
+  ])("drops malformed activity progress %j", async (override) => {
+    const activity = {
+      state: "loading",
+      totalDays: 10,
+      cachedDays: 0,
+      fetchedDays: 0,
+      records: 0,
+      completedWindows: 0,
+      totalWindows: 1,
+      windows: [],
+      retry: null,
+      elapsedMs: 0,
+      idleMs: 0,
+      ...override,
+    };
+    const observed: unknown[] = [];
+    const body = [
+      {
+        type: "progress",
+        completed: 0,
+        total: 2,
+        label: "MCP activity",
+        detail: "0 / 1",
+        activity,
+      },
+      { type: "data", data: response },
+    ]
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+
+    await readDashboardStream(byteStream(body, 5), (value) =>
+      observed.push(value),
+    );
+
+    expect(observed).toEqual([
+      { completed: 0, total: 2, label: "MCP activity", detail: "0 / 1" },
+    ]);
+  });
 });

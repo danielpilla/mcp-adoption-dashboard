@@ -125,7 +125,7 @@ describe("dashboard data controller", () => {
     expect(controller?.state.data).toBe(initialData);
   });
 
-  it("loads and validates a range outside the current data", async () => {
+  it("streams a range outside the current data with progress", async () => {
     const nextRange = {
       startDate: "2026-08-01",
       endDate: "2026-09-18",
@@ -135,12 +135,19 @@ describe("dashboard data controller", () => {
       range: nextRange,
       generatedAt: "2026-09-18T13:00:00.000Z",
     };
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify(responseData), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    );
+    const encoder = new TextEncoder();
+    let push: ((line: unknown) => void) | undefined;
+    let close: (() => void) | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) =>
+          controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`));
+        close = () => controller.close();
+      },
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(body, { status: 200 }));
     vi.stubGlobal("fetch", fetcher);
     let controller: DashboardDataController | undefined;
     function Harness() {
@@ -153,16 +160,127 @@ describe("dashboard data controller", () => {
     }
     await render(createElement(Harness));
 
+    let loading: Promise<void> | undefined;
     await act(async () => {
-      await controller?.actions.loadData(nextRange);
+      loading = controller?.actions.loadData(nextRange);
+    });
+    await act(async () => {
+      push?.({
+        type: "progress",
+        completed: 1,
+        total: 2,
+        label: "MCP activity",
+        detail: "1 / 2 date ranges",
+        activity: {
+          state: "loading",
+          totalDays: 49,
+          cachedDays: 19,
+          fetchedDays: 30,
+          records: 42,
+          completedWindows: 1,
+          totalWindows: 1,
+          windows: [],
+          retry: null,
+          elapsedMs: 900,
+          idleMs: 10,
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(controller?.state.loadProgress?.activity?.records).toBe(42);
+    expect(controller?.state.loading).toBe(true);
+    expect(controller?.state.data).toBe(initialData);
+    expect(controller?.state.loadProgress?.receivedAt).toEqual(
+      expect.any(Number),
+    );
+
+    await act(async () => {
+      push?.({ type: "data", data: responseData });
+      close?.();
+      await loading;
     });
 
     expect(fetcher).toHaveBeenCalledWith(
-      "/api/mcp?startDate=2026-08-01&endDate=2026-09-18",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      "/api/mcp/stream?startDate=2026-08-01&endDate=2026-09-18",
+      expect.objectContaining({
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
     );
     expect(controller?.state.data).toEqual(responseData);
     expect(controller?.state.activeRange).toEqual(nextRange);
     expect(controller?.state.loading).toBe(false);
+    expect(controller?.state.loadProgress).toBeNull();
+  });
+
+  it("requests setup when the stream reports an expired key", async () => {
+    const onSetupRequired = vi.fn();
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        `${JSON.stringify({
+          type: "error",
+          code: "SETUP_REQUIRED",
+          error: "Dashboard setup is required.",
+        })}\n`,
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    let controller: DashboardDataController | undefined;
+    function Harness() {
+      controller = useDashboardData({
+        initialData,
+        initialRange,
+        onSetupRequired,
+        onBeforeRangeChange: () => undefined,
+      });
+      return createElement("output", null, controller.state.error);
+    }
+    await render(createElement(Harness));
+
+    await act(async () => {
+      await controller?.actions.loadData({
+        startDate: "2026-08-01",
+        endDate: "2026-09-18",
+      });
+    });
+
+    expect(onSetupRequired).toHaveBeenCalledOnce();
+    expect(controller?.state.data).toBe(initialData);
+    expect(controller?.state.loadProgress).toBeNull();
+  });
+
+  it("keeps the current range when the stream fails", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        new Response(
+          `${JSON.stringify({ type: "error", error: "Upstream failed." })}\n`,
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetcher);
+    let controller: DashboardDataController | undefined;
+    function Harness() {
+      controller = useDashboardData({
+        initialData,
+        initialRange,
+        onBeforeRangeChange: () => undefined,
+      });
+      return createElement("output", null, controller.state.error);
+    }
+    await render(createElement(Harness));
+
+    await act(async () => {
+      await controller?.actions.loadData({
+        startDate: "2026-08-01",
+        endDate: "2026-09-18",
+      });
+    });
+
+    expect(controller?.state.error).toBe("Upstream failed.");
+    expect(controller?.state.activeRange).toEqual(initialRange);
+    expect(controller?.state.data).toBe(initialData);
   });
 });

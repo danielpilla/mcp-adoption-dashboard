@@ -11,12 +11,55 @@ export interface DirectoryLoadProgress {
   totalGroups: number | null;
 }
 
+interface ActivityWindowProgress {
+  startDate: string;
+  endDate: string;
+  days: number;
+  pagesLoaded: number;
+  /** Null until the upstream reports a page count. */
+  totalPages: number | null;
+}
+
+interface ActivityRetryProgress {
+  /** The attempt that runs after the wait, starting at 2. */
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  /** How long the request has waited so far. */
+  waitedMs: number;
+  reason: "rate_limited" | "server_error" | "network_error";
+  status: number | null;
+}
+
+/** Day-level progress of the activity load. */
+export interface ActivityLoadProgress {
+  state: "loading" | "reused" | "ready";
+  totalDays: number;
+  /** Days served from the per-day cache. */
+  cachedDays: number;
+  /** Days in fetch windows that finished. */
+  fetchedDays: number;
+  /** Activity rows loaded so far. */
+  records: number;
+  completedWindows: number;
+  totalWindows: number;
+  /** Windows being fetched now, newest first. */
+  windows: ActivityWindowProgress[];
+  retry: ActivityRetryProgress | null;
+  elapsedMs: number;
+  /** Time since the last page or window finished. */
+  idleMs: number;
+}
+
 export interface DashboardLoadProgress {
   completed: number;
   total: number;
   label: string;
   detail: string;
   directory?: DirectoryLoadProgress;
+  activity?: ActivityLoadProgress;
+  /** Client time when this progress arrived, in epoch milliseconds. */
+  receivedAt?: number;
 }
 
 export class DashboardSetupRequiredError extends Error {
@@ -54,6 +97,109 @@ export function parseDirectoryProgress(
   };
 }
 
+const ACTIVITY_STATES = new Set<string>(["loading", "reused", "ready"]);
+const RETRY_REASONS = new Set<string>([
+  "rate_limited",
+  "server_error",
+  "network_error",
+]);
+const MAX_ACTIVE_WINDOWS = 64;
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function parseWindow(value: unknown): ActivityWindowProgress | undefined {
+  if (
+    !isJsonObject(value) ||
+    !isIsoDate(value.startDate) ||
+    !isIsoDate(value.endDate) ||
+    !isCount(value.days) ||
+    !isCount(value.pagesLoaded) ||
+    (value.totalPages !== null && !isCount(value.totalPages))
+  ) {
+    return undefined;
+  }
+  return {
+    startDate: value.startDate,
+    endDate: value.endDate,
+    days: value.days,
+    pagesLoaded: value.pagesLoaded,
+    totalPages: value.totalPages,
+  };
+}
+
+function parseRetry(value: unknown): ActivityRetryProgress | null | undefined {
+  if (value === null) return null;
+  if (
+    !isJsonObject(value) ||
+    !isCount(value.attempt) ||
+    !isCount(value.maxAttempts) ||
+    !isCount(value.delayMs) ||
+    !isCount(value.waitedMs) ||
+    typeof value.reason !== "string" ||
+    !RETRY_REASONS.has(value.reason) ||
+    (value.status !== null && !isCount(value.status))
+  ) {
+    return undefined;
+  }
+  return {
+    attempt: value.attempt,
+    maxAttempts: value.maxAttempts,
+    delayMs: value.delayMs,
+    waitedMs: value.waitedMs,
+    reason: value.reason as ActivityRetryProgress["reason"],
+    status: value.status,
+  };
+}
+
+/** Validates the `activity` object of a progress event, or returns undefined. */
+function parseActivityProgress(
+  value: unknown,
+): ActivityLoadProgress | undefined {
+  if (
+    !isJsonObject(value) ||
+    typeof value.state !== "string" ||
+    !ACTIVITY_STATES.has(value.state) ||
+    !isCount(value.totalDays) ||
+    !isCount(value.cachedDays) ||
+    !isCount(value.fetchedDays) ||
+    !isCount(value.records) ||
+    !isCount(value.completedWindows) ||
+    !isCount(value.totalWindows) ||
+    !isCount(value.elapsedMs) ||
+    !isCount(value.idleMs) ||
+    !Array.isArray(value.windows) ||
+    value.windows.length > MAX_ACTIVE_WINDOWS
+  ) {
+    return undefined;
+  }
+  const windows: ActivityWindowProgress[] = [];
+  for (const item of value.windows) {
+    const window = parseWindow(item);
+    if (!window) return undefined;
+    windows.push(window);
+  }
+  const retry = parseRetry(value.retry);
+  if (retry === undefined) return undefined;
+  return {
+    state: value.state as ActivityLoadProgress["state"],
+    totalDays: value.totalDays,
+    cachedDays: Math.min(value.cachedDays, value.totalDays),
+    fetchedDays: Math.min(
+      value.fetchedDays,
+      Math.max(0, value.totalDays - value.cachedDays),
+    ),
+    records: value.records,
+    completedWindows: value.completedWindows,
+    totalWindows: value.totalWindows,
+    windows,
+    retry,
+    elapsedMs: value.elapsedMs,
+    idleMs: value.idleMs,
+  };
+}
+
 function handleDashboardEvent(
   line: string,
   records: unknown[],
@@ -74,12 +220,14 @@ function handleDashboardEvent(
       throw new Error("The local server returned invalid progress.");
     }
     const directory = parseDirectoryProgress(event.directory);
+    const activity = parseActivityProgress(event.activity);
     onProgress({
       completed: event.completed,
       total: event.total,
       label: event.label,
       detail: event.detail,
       ...(directory ? { directory } : {}),
+      ...(activity ? { activity } : {}),
     });
     return null;
   }
