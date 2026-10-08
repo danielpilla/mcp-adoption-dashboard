@@ -17,6 +17,10 @@ import {
   type McpRecord,
 } from "../../contracts/mcp-response.js";
 import {
+  summarizeCoverage,
+  type CacheCoverage,
+} from "../../contracts/startup-range.js";
+import {
   addDays,
   countRecordsWithinBytes,
   createMemoryDataset,
@@ -286,6 +290,20 @@ export class McpDayCache implements McpRunFactory {
   isCacheable(date: string): boolean {
     const today = this.now().toISOString().slice(0, 10);
     return date <= addDays(today, -(this.refetchDays + 1));
+  }
+
+  /**
+   * Coverage of the persisted days, from the in-memory index built when the
+   * cache was activated; no day file is read. Empty while the cache is not
+   * bound to a key.
+   */
+  coverage(): CacheCoverage {
+    const today = this.now().toISOString().slice(0, 10);
+    const cacheableThrough = addDays(today, -(this.refetchDays + 1));
+    const dates = this.fingerprint
+      ? [...this.sizes.keys()].filter((date) => date <= cacheableThrough).sort()
+      : [];
+    return summarizeCoverage(dates, cacheableThrough);
   }
 
   private async scan(): Promise<void> {

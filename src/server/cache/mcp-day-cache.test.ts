@@ -178,6 +178,44 @@ describe("MCP day cache", () => {
     expect(await readFile(path, "utf8")).toContain('"date":"2026-09-05"');
   });
 
+  it("reports coverage of the cacheable days from its index", async () => {
+    const { cache, directory } = await createCache();
+    const { client } = createClient();
+
+    expect(cache.coverage()).toEqual({
+      firstDate: null,
+      lastDate: null,
+      days: 0,
+      cacheableThrough: "2026-09-17",
+      spans: [],
+    });
+
+    await load(client, cache, "2026-08-25", "2026-08-31");
+    await load(client, cache, "2026-09-10", "2026-09-20");
+
+    expect(cache.coverage()).toEqual({
+      firstDate: "2026-08-25",
+      lastDate: "2026-09-17",
+      days: 15,
+      cacheableThrough: "2026-09-17",
+      spans: [
+        { startDate: "2026-08-25", endDate: "2026-08-31" },
+        { startDate: "2026-09-10", endDate: "2026-09-17" },
+      ],
+    });
+
+    const reopened = new McpDayCache({
+      directory,
+      maxBytes: 1024 * 1024,
+      refetchDays: 2,
+      now: () => new Date("2026-09-20T12:00:00Z"),
+    });
+    await reopened.open();
+    expect(reopened.coverage().days).toBe(0);
+    await reopened.activate("key-a");
+    expect(reopened.coverage()).toEqual(cache.coverage());
+  });
+
   it("drops every cached day when the API key changes", async () => {
     const { cache, directory } = await createCache();
     const { client, fetcher } = createClient();
