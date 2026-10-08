@@ -64,22 +64,56 @@ Successful responses contain:
 - `generatedAt`: ISO timestamp
 - `source`: `live` or `snapshot`
 - optional `team`: team ID, display name, member count, and group count
+- optional `notices`: non-blocking conditions, described below
 
 Each activity record contains `date`, `userId`, `email`, `displayName`,
 `server`, `tool`, and positive integer `usage`. Optional fields are `origin`,
 `role`, and `directoryGroups`. Unknown fields are stripped when browser or
 snapshot data is parsed.
 
+Each notice contains `code` and `message`, plus optional `setting`, `limit`,
+and `completeFrom`:
+
+- `LIMIT_REACHED`: a cap or timeout stopped loading early, and the response is
+  partial. `setting` names the environment variable to raise. When
+  `completeFrom` is present, activity from that date through `endDate` is
+  complete; earlier days are partial or missing. The newest days are always
+  kept first.
+- `DIRECTORY_LOADING`: directory groups are still loading in the background.
+  Activity is complete, but names, roles, and groups are not attached yet.
+- `DIRECTORY_UNAVAILABLE`: the directory could not be loaded. Activity is
+  complete without names, roles, and groups.
+
+The JSON body is written incrementally, so a large result is never held as one
+string on the server.
+
 ### `GET /api/mcp/stream`
 
 Uses the same range parameters and result contract. The response content type
 is `application/x-ndjson` with one JSON object per line:
 
-- `{ "type": "progress", ... }`: numeric `completed` and `total`, plus `label`
-  and `detail`
-- `{ "type": "data", "data": ... }`: the final analytics response
+- `{ "type": "progress", ... }`: numeric `completed` and `total`, plus `label`,
+  `detail`, and `directory` (`status`, `completedGroups`, and `totalGroups`,
+  which is `null` until known)
+- `{ "type": "records", "records": [...] }`: a batch of up to 5,000 activity
+  records, in ascending date order
+- `{ "type": "data", "data": ... }`: the final analytics response without
+  `records`; clients append the batches in order
 - `{ "type": "error", "error": "..." }`: a sanitized terminal error and,
   when setup is required, a `code`
+
+Optional query parameter `refresh=1` behaves as it does for `GET /api/mcp`.
+
+### `GET /api/directory/status`
+
+Returns the state of the background directory load:
+
+```json
+{ "status": "loading", "completedGroups": 120, "totalGroups": 400 }
+```
+
+`status` is `disabled`, `idle`, `loading`, `ready`, or `failed`. `totalGroups`
+is `null` until the number of groups is known.
 
 ## Errors and limits
 
@@ -87,14 +121,19 @@ JSON routes return `{ "error": "..." }`. A setup-required response also
 contains `{ "code": "SETUP_REQUIRED" }`. Upstream bodies and stack traces are
 not returned.
 
-The server validates dates, pagination, text lengths, JSON response sizes,
-record counts, directory-group counts, membership counts, enriched group
-assignments, and estimated analytics response bytes. Optional environment
-variables can raise or lower the high default process-safety limits:
+The server validates dates, pagination, text lengths, and JSON structure. These
+optional environment variables cap work per request; their defaults are high
+enough that they are not reached in normal use:
 
+- `MAX_MCP_RECORDS`
 - `MAX_MCP_RESPONSE_BYTES`
+- `MAX_API_PAGE_BYTES`
 - `MAX_DIRECTORY_GROUPS`
 - `MAX_GROUP_MEMBERSHIPS`
 - `MAX_ENRICHED_GROUP_ASSIGNMENTS`
+- `ANALYTICS_TIMEOUT_MS`
+- `DIRECTORY_LOAD_TIMEOUT_MS`
 
-Oversized upstream datasets fail with a sanitized HTTP 502 response.
+Reaching a cap returns HTTP 200 with the data loaded so far and a
+`LIMIT_REACHED` notice; it never fails the request or stops the server.
+Malformed upstream data still fails with a sanitized HTTP 502 response.
