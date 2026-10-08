@@ -26,6 +26,22 @@ export interface DateRange {
   endDate: string;
 }
 
+type McpResponseNoticeCode =
+  "LIMIT_REACHED" | "DIRECTORY_LOADING" | "DIRECTORY_UNAVAILABLE";
+
+/**
+ * A non-blocking condition attached to a response. LIMIT_REACHED means the
+ * response is partial; `completeFrom` is the first date from which activity
+ * through the end of the range is complete, when any day is complete.
+ */
+export interface McpResponseNotice {
+  code: McpResponseNoticeCode;
+  message: string;
+  setting?: string;
+  limit?: number;
+  completeFrom?: string;
+}
+
 export interface McpResponse {
   records: McpRecord[];
   summary: McpSummary;
@@ -38,7 +54,15 @@ export interface McpResponse {
     memberCount: number;
     groupCount: number;
   };
+  notices?: McpResponseNotice[];
 }
+
+const NOTICE_CODES: ReadonlySet<string> = new Set<McpResponseNoticeCode>([
+  "LIMIT_REACHED",
+  "DIRECTORY_LOADING",
+  "DIRECTORY_UNAVAILABLE",
+]);
+const MAX_NOTICES = 20;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -91,31 +115,57 @@ function isMcpRecord(value: unknown): value is McpRecord {
   );
 }
 
+/** Validates one activity record and strips unknown fields. */
+export function parseMcpRecord(record: unknown): McpRecord {
+  if (!isMcpRecord(record)) {
+    throw new Error("Invalid dashboard data: an activity record is malformed.");
+  }
+  return {
+    date: record.date,
+    userId: record.userId,
+    email: record.email,
+    displayName: record.displayName,
+    server: record.server,
+    tool: record.tool,
+    usage: record.usage,
+    ...(record.origin ? { origin: record.origin } : {}),
+    ...(record.role !== undefined ? { role: record.role } : {}),
+    ...(record.directoryGroups
+      ? { directoryGroups: [...record.directoryGroups] }
+      : {}),
+  };
+}
+
+function parseNotice(value: unknown): McpResponseNotice {
+  if (
+    !isObject(value) ||
+    typeof value.code !== "string" ||
+    !NOTICE_CODES.has(value.code) ||
+    !isText(value.message, 1_000) ||
+    (value.setting !== undefined &&
+      (typeof value.setting !== "string" ||
+        !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.setting))) ||
+    (value.limit !== undefined && !isNonNegativeSafeInteger(value.limit)) ||
+    (value.completeFrom !== undefined && !isIsoDate(value.completeFrom))
+  ) {
+    throw new Error("Invalid dashboard data: a notice is malformed.");
+  }
+  return {
+    code: value.code as McpResponseNoticeCode,
+    message: value.message,
+    ...(value.setting !== undefined ? { setting: value.setting } : {}),
+    ...(value.limit !== undefined ? { limit: value.limit } : {}),
+    ...(value.completeFrom !== undefined
+      ? { completeFrom: value.completeFrom }
+      : {}),
+  };
+}
+
 export function parseMcpResponse(value: unknown): McpResponse {
   if (!isObject(value) || !Array.isArray(value.records)) {
     throw new Error("Invalid dashboard data: records are missing.");
   }
-  const records = value.records.map((record): McpRecord => {
-    if (!isMcpRecord(record)) {
-      throw new Error(
-        "Invalid dashboard data: an activity record is malformed.",
-      );
-    }
-    return {
-      date: record.date,
-      userId: record.userId,
-      email: record.email,
-      displayName: record.displayName,
-      server: record.server,
-      tool: record.tool,
-      usage: record.usage,
-      ...(record.origin ? { origin: record.origin } : {}),
-      ...(record.role !== undefined ? { role: record.role } : {}),
-      ...(record.directoryGroups
-        ? { directoryGroups: [...record.directoryGroups] }
-        : {}),
-    };
-  });
+  const records = value.records.map(parseMcpRecord);
   if (!isObject(value.range)) {
     throw new Error("Invalid dashboard data: date range is missing.");
   }
@@ -169,6 +219,13 @@ export function parseMcpResponse(value: unknown): McpResponse {
       groupCount: value.team.groupCount,
     };
   }
+  let notices: McpResponseNotice[] | undefined;
+  if (value.notices !== undefined) {
+    if (!Array.isArray(value.notices) || value.notices.length > MAX_NOTICES) {
+      throw new Error("Invalid dashboard data: notices are malformed.");
+    }
+    notices = value.notices.map(parseNotice);
+  }
   return {
     records,
     summary: {
@@ -181,23 +238,42 @@ export function parseMcpResponse(value: unknown): McpResponse {
     generatedAt: value.generatedAt,
     source: value.source,
     ...(team ? { team } : {}),
+    ...(notices && notices.length > 0 ? { notices } : {}),
   };
 }
 
-export function summarizeMcpRecords(records: readonly McpRecord[]): McpSummary {
-  let totalUsage = 0;
-  for (const record of records) {
-    totalUsage += record.usage;
-    if (!Number.isSafeInteger(totalUsage)) {
+/**
+ * Accumulates a summary one record at a time so large results can be
+ * summarized while they are streamed instead of after they are buffered.
+ */
+export class McpSummaryAccumulator {
+  private totalUsage = 0;
+  private readonly users = new Set<string>();
+  private readonly servers = new Set<string>();
+  private readonly tools = new Set<string>();
+
+  add(record: McpRecord): void {
+    this.totalUsage += record.usage;
+    if (!Number.isSafeInteger(this.totalUsage)) {
       throw new RangeError("MCP usage total exceeds safe integer precision.");
     }
+    this.users.add(record.email);
+    this.servers.add(record.server);
+    this.tools.add(mcpToolPairKey(record.server, record.tool));
   }
-  return {
-    totalUsage,
-    uniqueUsers: new Set(records.map((record) => record.email)).size,
-    uniqueServers: new Set(records.map((record) => record.server)).size,
-    uniqueTools: new Set(
-      records.map((record) => mcpToolPairKey(record.server, record.tool)),
-    ).size,
-  };
+
+  result(): McpSummary {
+    return {
+      totalUsage: this.totalUsage,
+      uniqueUsers: this.users.size,
+      uniqueServers: this.servers.size,
+      uniqueTools: this.tools.size,
+    };
+  }
+}
+
+export function summarizeMcpRecords(records: readonly McpRecord[]): McpSummary {
+  const summary = new McpSummaryAccumulator();
+  for (const record of records) summary.add(record);
+  return summary.result();
 }

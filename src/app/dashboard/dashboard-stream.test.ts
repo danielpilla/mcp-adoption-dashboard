@@ -120,4 +120,62 @@ describe("dashboard stream reader", () => {
       ),
     ).rejects.toThrow("invalid event");
   });
+
+  it("assembles record batches into the final response", async () => {
+    const { records, ...rest } = response;
+    const body = [
+      JSON.stringify({ type: "records", records }),
+      JSON.stringify({ type: "records", records: [] }),
+      JSON.stringify({ type: "data", data: rest }),
+    ].join("\n");
+
+    await expect(
+      readDashboardStream(byteStream(body, 7), () => undefined),
+    ).resolves.toEqual(response);
+  });
+
+  it("rejects record batches that do not match the summary", async () => {
+    const body = [
+      JSON.stringify({ type: "records", records: response.records }),
+      JSON.stringify({ type: "records", records: response.records }),
+      JSON.stringify({
+        type: "data",
+        data: { ...response, records: undefined },
+      }),
+    ].join("\n");
+
+    await expect(
+      readDashboardStream(byteStream(body, 7), () => undefined),
+    ).rejects.toThrow();
+  });
+
+  it("reports directory progress with activity progress", async () => {
+    const progress = {
+      type: "progress",
+      completed: 1,
+      total: 2,
+      label: "MCP activity",
+      detail: "1 / 1 windows",
+      directory: { status: "loading", completedGroups: 3, totalGroups: null },
+    };
+    const observed: unknown[] = [];
+    const body = `${JSON.stringify(progress)}\n${JSON.stringify({
+      type: "data",
+      data: response,
+    })}`;
+
+    await readDashboardStream(byteStream(body, 3), (value) =>
+      observed.push(value),
+    );
+
+    expect(observed).toEqual([
+      {
+        completed: 1,
+        total: 2,
+        label: "MCP activity",
+        detail: "1 / 1 windows",
+        directory: { status: "loading", completedGroups: 3, totalGroups: null },
+      },
+    ]);
+  });
 });

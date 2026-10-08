@@ -117,4 +117,45 @@ describe("setup gate stream handling", () => {
       "The local server returned invalid progress.",
     );
   });
+
+  it("shows directory progress while the dashboard loads", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            `${JSON.stringify({
+              type: "progress",
+              completed: 1,
+              total: 3,
+              label: "MCP activity",
+              detail: "1 / 2 date ranges",
+              directory: {
+                status: "loading",
+                completedGroups: 2,
+                totalGroups: 5,
+              },
+            })}\n`,
+          ),
+        );
+      },
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(setupStatusResponse())
+      .mockResolvedValueOnce(new Response(body, { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+    const container = await render(
+      createElement(SetupGate, { initialData: null }),
+    );
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(container.textContent).toContain("2 of 5 groups loaded"),
+      );
+    });
+
+    expect(container.textContent).toContain("Directory groups");
+    expect(container.textContent).toContain("40%");
+  });
 });

@@ -1,17 +1,15 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  CursorApiClient,
-  DEFAULT_CURSOR_API_LIMITS,
-} from "./cursor/cursor-api.js";
+import { CursorApiClient } from "./cursor/cursor-api.js";
+import { McpDayCache } from "./cache/mcp-day-cache.js";
 import { createApp } from "./http/http-server.js";
 import {
   assertNetworkBindingAllowed,
   isLoopbackHost,
   parsePort,
-  parsePositiveInteger,
 } from "./configuration/server-configuration.js";
+import { readRuntimeSettings } from "./configuration/runtime-settings.js";
 import {
   validateSavedClient,
   writeSetupEnv,
@@ -25,28 +23,7 @@ if (existsSync(".env")) {
 const apiKey = process.env.CURSOR_API_KEY?.trim();
 const port = parsePort(process.env.SERVER_PORT, 4173, "SERVER_PORT");
 const teamName = process.env.CURSOR_TEAM_NAME?.trim() ?? "";
-const cursorApiLimits = {
-  maxResponseBytes: parsePositiveInteger(
-    process.env.MAX_MCP_RESPONSE_BYTES,
-    DEFAULT_CURSOR_API_LIMITS.maxResponseBytes,
-    "MAX_MCP_RESPONSE_BYTES",
-  ),
-  maxDirectoryGroups: parsePositiveInteger(
-    process.env.MAX_DIRECTORY_GROUPS,
-    DEFAULT_CURSOR_API_LIMITS.maxDirectoryGroups,
-    "MAX_DIRECTORY_GROUPS",
-  ),
-  maxGroupMemberships: parsePositiveInteger(
-    process.env.MAX_GROUP_MEMBERSHIPS,
-    DEFAULT_CURSOR_API_LIMITS.maxGroupMemberships,
-    "MAX_GROUP_MEMBERSHIPS",
-  ),
-};
-const maxEnrichedGroupAssignments = parsePositiveInteger(
-  process.env.MAX_ENRICHED_GROUP_ASSIGNMENTS,
-  DEFAULT_CURSOR_API_LIMITS.maxEnrichedGroupAssignments,
-  "MAX_ENRICHED_GROUP_ASSIGNMENTS",
-);
+const settings = readRuntimeSettings(process.env);
 configureInternalMcpServers(process.env.INTERNAL_MCP_SERVERS);
 const staticDir = fileURLToPath(new URL("../../dist", import.meta.url));
 const host = process.env.BIND_HOST?.trim() || "127.0.0.1";
@@ -62,16 +39,51 @@ const createClient = (key: string) =>
     undefined,
     teamName,
     undefined,
-    cursorApiLimits,
+    settings.cursorApiLimits,
   );
-const VALIDATION_TIMEOUT_MS = 5 * 60_000;
+
+/*
+ * Activity is persisted per day so reloads fetch only uncached days. When
+ * the directory cannot be used, results are still collected in memory.
+ */
+const warnCacheUnavailable = (reason: string) =>
+  console.warn(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "warn",
+      event: "activity_cache.unavailable",
+      reason,
+    }),
+  );
+let activityStore: McpDayCache | undefined = new McpDayCache({
+  directory: resolve(settings.mcpCache.directory),
+  maxBytes: settings.mcpCache.maxBytes,
+  refetchDays: settings.mcpCache.refetchDays,
+});
+try {
+  await activityStore.open();
+} catch {
+  activityStore = undefined;
+  warnCacheUnavailable(
+    "The MCP_CACHE_DIR directory is not writable; activity is kept in memory.",
+  );
+}
+if (activityStore && apiKey) {
+  await activityStore
+    .activate(apiKey)
+    .catch(() =>
+      warnCacheUnavailable(
+        "The activity cache could not be prepared; days are not persisted.",
+      ),
+    );
+}
 
 const client = apiKey ? createClient(apiKey) : undefined;
 const shutdownController = new AbortController();
 const validationSignal = () =>
   AbortSignal.any([
     shutdownController.signal,
-    AbortSignal.timeout(VALIDATION_TIMEOUT_MS),
+    AbortSignal.timeout(settings.validationTimeoutMs),
   ]);
 const initialClientValidation = client
   ? validateSavedClient(client, validationSignal())
@@ -84,18 +96,22 @@ const app = createApp({
     allowed: setupAllowed,
     configure: async (key, signal) => {
       const candidate = createClient(key);
-      const metadata = await candidate.fetchTeamMetadata(
+      await candidate.validateApiKey(
         signal
           ? AbortSignal.any([signal, validationSignal()])
           : validationSignal(),
       );
-      return { client: candidate, metadata };
+      return candidate;
     },
     persist: (key) => writeSetupEnv(resolve(".env"), key),
   },
   staticDir,
   teamName,
-  maxEnrichedGroupAssignments,
+  cacheMaxRecords: settings.maxCachedRecords,
+  maxEnrichedGroupAssignments: settings.maxEnrichedGroupAssignments,
+  analyticsTimeoutMs: settings.analyticsTimeoutMs,
+  directoryTimeoutMs: settings.directoryTimeoutMs,
+  activityStore,
   shutdownSignal: shutdownController.signal,
 });
 

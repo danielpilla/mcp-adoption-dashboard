@@ -11,6 +11,15 @@ reload data. **Refresh** bypasses the 12-hour server cache while preserving
 the current date drill-down and associative selections. Refreshes for the same
 range are limited to once every 10 seconds.
 
+The loading screen shows activity progress and, separately, the background
+directory load. The dashboard opens as soon as activity is loaded; while the
+directory is still loading, a notice shows its progress and names, roles, and
+group filters appear automatically when it finishes.
+
+If a cap or timeout is reached, the dashboard shows the data loaded so far,
+newest days first, with a notice that names the setting to raise. When some
+days are complete, **Show complete days from** narrows the view to them.
+
 Search users, email addresses, MCP labels, and tools with `Cmd/Ctrl+K`. Filters
 support users, MCPs, MCP type (internal or external), tools, directory groups,
 and multiple calendar grains. Values within one field are combined with OR;

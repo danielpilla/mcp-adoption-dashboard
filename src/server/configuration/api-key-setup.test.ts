@@ -9,36 +9,30 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import {
-  CursorApiClient,
-  CursorApiError,
-  type TeamMetadata,
-} from "../cursor/cursor-api";
+import { CursorApiClient, CursorApiError } from "../cursor/cursor-api";
 import { validateSavedClient, writeSetupEnv } from "./api-key-setup";
 
-const metadata: TeamMetadata = {
-  users: new Map(),
-  memberCount: 1,
-  groupNames: [],
-};
-
 describe("saved API key validation", () => {
-  it("accepts a key that can load team metadata", async () => {
+  it("accepts a key with one lightweight request and no directory load", async () => {
     const client = new CursorApiClient("valid");
-    vi.spyOn(client, "fetchTeamMetadata").mockResolvedValue(metadata);
+    const validateApiKey = vi
+      .spyOn(client, "validateApiKey")
+      .mockResolvedValue({ teamId: "team-1" });
+    const fetchTeamMetadata = vi.spyOn(client, "fetchTeamMetadata");
 
     await expect(validateSavedClient(client)).resolves.toEqual({
       client,
-      metadata,
       status: "valid",
     });
+    expect(validateApiKey).toHaveBeenCalledOnce();
+    expect(fetchTeamMetadata).not.toHaveBeenCalled();
   });
 
   it.each([401, 403])(
     "returns to setup mode for a rejected key (%s)",
     async (status) => {
       const client = new CursorApiClient("invalid");
-      vi.spyOn(client, "fetchTeamMetadata").mockRejectedValue(
+      vi.spyOn(client, "validateApiKey").mockRejectedValue(
         new CursorApiError("rejected", status),
       );
 
@@ -50,7 +44,7 @@ describe("saved API key validation", () => {
 
   it("keeps the key during a transient Cursor outage", async () => {
     const client = new CursorApiClient("temporarily-unavailable");
-    vi.spyOn(client, "fetchTeamMetadata").mockRejectedValue(
+    vi.spyOn(client, "validateApiKey").mockRejectedValue(
       new CursorApiError("unavailable", 503),
     );
 

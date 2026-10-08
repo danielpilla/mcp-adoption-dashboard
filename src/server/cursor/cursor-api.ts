@@ -1,6 +1,25 @@
-import type { McpRecord, McpResponse } from "../../contracts/mcp-response.js";
+import type {
+  McpRecord,
+  McpResponse,
+  McpResponseNotice,
+} from "../../contracts/mcp-response.js";
 import { summarizeMcpRecords } from "../../contracts/mcp-response.js";
 import { classifyMcpServer } from "../../contracts/mcp-origin.js";
+import {
+  activityLimitNotice,
+  buildSegments,
+  datesBetween,
+  DuplicateMetricError,
+  formatCount,
+  MemoryMcpRun,
+  planIncludedDays,
+  recordBytes,
+  type ActivityLimitReason,
+  type CollectionSegment,
+  type McpDataset,
+  type McpRun,
+  type McpRunFactory,
+} from "./mcp-collection.js";
 
 const DEFAULT_BASE_URL = "https://api.cursor.com";
 const PAGE_SIZE = 500;
@@ -8,17 +27,26 @@ const MAX_ATTEMPTS = 5;
 const MAX_PAGE_COUNT = 1_000;
 const MAX_NO_PROGRESS_PAGES = 3;
 const MAX_RETRY_DELAY_MS = 120_000;
-const DEFAULT_MAX_RECORD_COUNT = 250_000;
+const DEFAULT_MAX_RECORDS = 100_000_000;
+// Estimated serialized size per record, with headroom for long labels.
+const ESTIMATED_RECORD_BYTES = 256;
+/**
+ * Defaults are sized so that ordinary use never reaches them. Each one is an
+ * optional cap that operators can lower; reaching one yields a partial result
+ * with a notice instead of an error.
+ */
 export const DEFAULT_CURSOR_API_LIMITS = {
-  maxResponseBytes: 128 * 1024 * 1024,
-  maxDirectoryGroups: 10_000,
-  maxGroupMemberships: 250_000,
-  maxEnrichedGroupAssignments: 250_000,
+  maxRecords: DEFAULT_MAX_RECORDS,
+  maxResponseBytes: DEFAULT_MAX_RECORDS * ESTIMATED_RECORD_BYTES,
+  maxPageBytes: 64 * 1024 * 1024,
+  maxDirectoryGroups: 1_000_000,
+  maxGroupMemberships: 100_000_000,
+  maxEnrichedGroupAssignments: 1_000_000_000,
 } as const;
 const ADMIN_REQUEST_LIMIT = 20;
 const ADMIN_REQUEST_WINDOW_MS = 60_000;
 const WINDOW_CONCURRENCY = 4;
-const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
+const WINDOW_DAYS = 30;
 const MAX_ERROR_RESPONSE_BYTES = 16 * 1024;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -32,11 +60,26 @@ export interface TeamMetadata {
   users: Map<string, TeamUserMetadata>;
   memberCount: number;
   groupNames: string[];
+  /** Present when a cap stopped directory loading early. */
+  notices?: McpResponseNotice[];
 }
 
 export interface McpFetchProgress {
   completedWindows: number;
   totalWindows: number;
+  cachedDays?: number;
+}
+
+export interface McpDatasetOptions {
+  memberNames?: Map<string, string>;
+  onProgress?: (progress: McpFetchProgress) => void;
+  /** Cancels the collection; the returned promise rejects. */
+  signal?: AbortSignal;
+  /** Stops the collection early; the result is partial with a notice. */
+  deadline?: AbortSignal;
+  deadlineMs?: number;
+  /** Disk-backed storage. Without it, records are collected in memory. */
+  runs?: McpRunFactory;
 }
 
 export interface TeamMetadataProgress {
@@ -54,13 +97,30 @@ export class CursorApiError extends Error {
   }
 }
 
+/** A single upstream page exceeded the configured page-size cap. */
+class PageLimitError extends CursorApiError {
+  constructor() {
+    super("Cursor API response exceeded the size limit", 502);
+    this.name = "PageLimitError";
+  }
+}
+
 type Fetcher = typeof fetch;
 type Sleeper = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 type Pagination = { totalPages?: number; hasNextPage?: boolean };
-type RecordBudget = { remaining: number; remainingBytes: number };
+type WindowOutcome = "complete" | "records" | "bytes";
+
+interface WindowHooks {
+  /** Remaining capacity for this window, evaluated at the start of a page. */
+  allowance(): { records: number; bytes: number };
+  consume(records: number, bytes: number): void;
+  write(records: McpRecord[]): Promise<void>;
+}
 
 export interface CursorApiLimits {
+  maxRecords: number;
   maxResponseBytes: number;
+  maxPageBytes: number;
   maxDirectoryGroups: number;
   maxGroupMemberships: number;
 }
@@ -221,14 +281,13 @@ function abortableSleep(
 async function readResponseText(
   response: Response,
   maxBytes: number,
+  createError: () => CursorApiError = () =>
+    new CursorApiError("Cursor API response exceeded the size limit", 502),
 ): Promise<string> {
   const declaredLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     await response.body?.cancel().catch(() => undefined);
-    throw new CursorApiError(
-      "Cursor API response exceeded the size limit",
-      502,
-    );
+    throw createError();
   }
   if (!response.body) return "";
 
@@ -242,10 +301,7 @@ async function readResponseText(
     bytesRead += value.byteLength;
     if (bytesRead > maxBytes) {
       await reader.cancel().catch(() => undefined);
-      throw new CursorApiError(
-        "Cursor API response exceeded the size limit",
-        502,
-      );
+      throw createError();
     }
     text += decoder.decode(value, { stream: true });
   }
@@ -270,31 +326,15 @@ export function retryDelayMilliseconds(
   return capped(Number.isFinite(retryAt) ? retryAt - now : fallback);
 }
 
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  mapper: (item: T) => Promise<R>,
-  signal?: AbortSignal,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const worker = async () => {
-    for (;;) {
-      signal?.throwIfAborted();
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= items.length) return;
-      const item = items[index];
-      if (item === undefined) {
-        throw new RangeError(`Missing concurrency item at index ${index}.`);
-      }
-      results[index] = await mapper(item);
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
-  );
-  return results;
+function positiveLimit(value: number | undefined, fallback: number): number {
+  return Math.max(1, Math.floor(value ?? fallback));
+}
+
+function isDeadlineAbort(
+  deadline: AbortSignal | undefined,
+  signal: AbortSignal | undefined,
+): boolean {
+  return Boolean(deadline?.aborted) && !signal?.aborted;
 }
 
 export class CursorApiClient {
@@ -310,30 +350,30 @@ export class CursorApiClient {
     private readonly fetcher: Fetcher = fetch,
     private readonly sleep: Sleeper = abortableSleep,
     private readonly teamName = "",
-    private readonly maxRecordCount = DEFAULT_MAX_RECORD_COUNT,
+    maxRecordCount?: number,
     limits: Partial<CursorApiLimits> = {},
   ) {
     this.authorization = `Basic ${Buffer.from(`${apiKey}:`).toString("base64")}`;
     this.limits = {
-      maxResponseBytes: Math.max(
-        1,
-        Math.floor(
-          limits.maxResponseBytes ?? DEFAULT_CURSOR_API_LIMITS.maxResponseBytes,
-        ),
+      maxRecords: positiveLimit(
+        maxRecordCount ?? limits.maxRecords,
+        DEFAULT_CURSOR_API_LIMITS.maxRecords,
       ),
-      maxDirectoryGroups: Math.max(
-        1,
-        Math.floor(
-          limits.maxDirectoryGroups ??
-            DEFAULT_CURSOR_API_LIMITS.maxDirectoryGroups,
-        ),
+      maxResponseBytes: positiveLimit(
+        limits.maxResponseBytes,
+        DEFAULT_CURSOR_API_LIMITS.maxResponseBytes,
       ),
-      maxGroupMemberships: Math.max(
-        1,
-        Math.floor(
-          limits.maxGroupMemberships ??
-            DEFAULT_CURSOR_API_LIMITS.maxGroupMemberships,
-        ),
+      maxPageBytes: positiveLimit(
+        limits.maxPageBytes,
+        DEFAULT_CURSOR_API_LIMITS.maxPageBytes,
+      ),
+      maxDirectoryGroups: positiveLimit(
+        limits.maxDirectoryGroups,
+        DEFAULT_CURSOR_API_LIMITS.maxDirectoryGroups,
+      ),
+      maxGroupMemberships: positiveLimit(
+        limits.maxGroupMemberships,
+        DEFAULT_CURSOR_API_LIMITS.maxGroupMemberships,
       ),
     };
   }
@@ -420,7 +460,11 @@ export class CursorApiClient {
       }
 
       if (response.ok) {
-        const text = await readResponseText(response, MAX_JSON_RESPONSE_BYTES);
+        const text = await readResponseText(
+          response,
+          this.limits.maxPageBytes,
+          () => new PageLimitError(),
+        );
         try {
           const parsed: unknown = JSON.parse(text);
           return parsed;
@@ -461,11 +505,47 @@ export class CursorApiClient {
     throw new CursorApiError("Cursor API retry limit exceeded", 502);
   }
 
+  /** Validates the key with one small analytics request. */
+  async validateApiKey(signal?: AbortSignal): Promise<{ teamId: string }> {
+    const today = new Date().toISOString().slice(0, 10);
+    const query = new URLSearchParams({
+      startDate: today,
+      endDate: today,
+      page: "1",
+      pageSize: "1",
+    });
+    const payload = requireObject(
+      await this.requestJson(`/analytics/by-user/mcp?${query}`, signal),
+      "MCP analytics",
+    );
+    const params =
+      payload.params === undefined
+        ? undefined
+        : requireObject(payload.params, "MCP analytics parameters");
+    const teamId = boundedText(params?.teamId, "team ID", 512, true);
+    if (teamId && !this.teamId) this.teamId = teamId;
+    return { teamId };
+  }
+
+  /**
+   * Loads members, directory groups, and memberships. Reaching a directory
+   * cap or the deadline stops loading and returns what was loaded so far with
+   * a notice; `signal` cancels the load entirely.
+   */
   async fetchTeamMetadata(
     signal?: AbortSignal,
     onProgress?: (progress: TeamMetadataProgress) => void,
+    deadline?: AbortSignal,
+    deadlineMs = 0,
   ): Promise<TeamMetadata> {
-    const rawMemberPayload = await this.requestJson("/teams/members", signal);
+    const requestSignal =
+      deadline && signal
+        ? AbortSignal.any([signal, deadline])
+        : (deadline ?? signal);
+    const rawMemberPayload = await this.requestJson(
+      "/teams/members",
+      requestSignal,
+    );
     const memberPayload = requireObject(rawMemberPayload, "team members");
     const teamMembers = requireObjectArray(
       memberPayload.teamMembers,
@@ -495,6 +575,26 @@ export class CursorApiClient {
     }
     onProgress?.({ completedGroups: 0 });
 
+    let stopNotice: McpResponseNotice | undefined;
+    const stop = (reason: DirectoryLimitReason, limit: number) => {
+      stopNotice ??= directoryLimitNotice(reason, limit);
+    };
+    const requestDirectoryPage = async (path: string) => {
+      try {
+        return await this.requestJson(path, requestSignal);
+      } catch (error) {
+        if (error instanceof PageLimitError) {
+          stop("page", this.limits.maxPageBytes);
+          return undefined;
+        }
+        if (isDeadlineAbort(deadline, signal)) {
+          stop("timeout", deadlineMs);
+          return undefined;
+        }
+        throw error;
+      }
+    };
+
     const resolveEmail = (member: {
       userId?: unknown;
       id?: unknown;
@@ -509,14 +609,12 @@ export class CursorApiClient {
     const directoryGroups: Array<{ id: string; name: string }> = [];
     const seenDirectoryGroups = new Set<string>();
     let directoryGroupNoProgressPages = 0;
-    for (let page = 1; ; page += 1) {
-      const payload = requireObject(
-        await this.requestJson(
-          `/teams/directory-groups?page=${page}&pageSize=100`,
-          signal,
-        ),
-        "directory groups",
+    listing: for (let page = 1; ; page += 1) {
+      const rawPayload = await requestDirectoryPage(
+        `/teams/directory-groups?page=${page}&pageSize=100`,
       );
+      if (rawPayload === undefined) break;
+      const payload = requireObject(rawPayload, "directory groups");
       const groups = requireObjectArray(payload.groups, "directory groups");
       const pagination = requirePagination(payload.pagination);
       const seenBefore = seenDirectoryGroups.size;
@@ -525,10 +623,8 @@ export class CursorApiClient {
         const name = boundedText(group.name, "directory group name", 512);
         if (id && name && !seenDirectoryGroups.has(id)) {
           if (directoryGroups.length >= this.limits.maxDirectoryGroups) {
-            throw new CursorApiError(
-              "Cursor API directory groups exceed the configured safety limit",
-              502,
-            );
+            stop("groups", this.limits.maxDirectoryGroups);
+            break listing;
           }
           seenDirectoryGroups.add(id);
           directoryGroups.push({ id, name });
@@ -555,13 +651,12 @@ export class CursorApiClient {
       const seenMembers = new Set<string>();
       let noProgressPages = 0;
       for (let page = 1; ; page += 1) {
-        const payload = requireObject(
-          await this.requestJson(
-            `/teams/directory-groups/${encodeURIComponent(group.id)}/members?page=${page}&pageSize=200`,
-            signal,
-          ),
-          "directory group members",
+        if (stopNotice) return;
+        const rawPayload = await requestDirectoryPage(
+          `/teams/directory-groups/${encodeURIComponent(group.id)}/members?page=${page}&pageSize=200`,
         );
+        if (rawPayload === undefined) return;
+        const payload = requireObject(rawPayload, "directory group members");
         const members = requireObjectArray(
           payload.members,
           "directory group members",
@@ -579,13 +674,11 @@ export class CursorApiClient {
               true,
             );
           if (identity && !seenMembers.has(identity)) {
-            groupMembershipCount += 1;
-            if (groupMembershipCount > this.limits.maxGroupMemberships) {
-              throw new CursorApiError(
-                "Cursor API group memberships exceed the configured safety limit",
-                502,
-              );
+            if (groupMembershipCount >= this.limits.maxGroupMemberships) {
+              stop("memberships", this.limits.maxGroupMemberships);
+              return;
             }
+            groupMembershipCount += 1;
             seenMembers.add(identity);
           }
           const metadata = users.get(email);
@@ -608,7 +701,7 @@ export class CursorApiClient {
     let completedGroups = 0;
     for (
       let index = 0;
-      index < directoryGroups.length;
+      index < directoryGroups.length && !stopNotice;
       index += WINDOW_CONCURRENCY
     ) {
       const batch = directoryGroups.slice(index, index + WINDOW_CONCURRENCY);
@@ -628,18 +721,23 @@ export class CursorApiClient {
       users,
       memberCount: users.size,
       groupNames: [...groupNames].sort((a, b) => a.localeCompare(b)),
+      ...(stopNotice ? { notices: [stopNotice] } : {}),
     };
   }
 
+  /**
+   * Fetches one window page by page. Each page is checked against the
+   * window's remaining capacity, written out, and released, so memory stays
+   * bounded by one page regardless of the window's size.
+   */
   private async fetchMcpWindow(
     startDate: string,
     endDate: string,
     memberNames: Map<string, string>,
-    budget: RecordBudget,
+    hooks: WindowHooks,
     signal?: AbortSignal,
-  ): Promise<McpRecord[]> {
-    const records: McpRecord[] = [];
-    const metricKeys = new Set<string>();
+  ): Promise<WindowOutcome> {
+    let previousPageKeys = new Set<string>();
     let noProgressPages = 0;
 
     for (let page = 1; ; page += 1) {
@@ -663,7 +761,6 @@ export class CursorApiClient {
         params?.userMappings,
         "MCP user mappings",
       );
-      const metricCountBefore = metricKeys.size;
       const responseTeamId = boundedText(params?.teamId, "team ID", 512, true);
       if (responseTeamId) {
         if (this.teamId && this.teamId !== responseTeamId) {
@@ -681,6 +778,10 @@ export class CursorApiClient {
         ]),
       );
 
+      const pageKeys = new Set<string>();
+      const candidates: { date: string; record?: McpRecord; bytes: number }[] =
+        [];
+      let madeProgress = false;
       let itemCount = 0;
       for (const [rawEmail, rawMetrics] of Object.entries(data)) {
         const email = boundedText(
@@ -720,24 +821,19 @@ export class CursorApiClient {
             );
           }
           const recordKey = JSON.stringify([email, date, server, tool]);
-          if (metricKeys.has(recordKey)) {
+          if (pageKeys.has(recordKey)) {
             throw new CursorApiError(
               "Cursor API returned a duplicate MCP metric",
               502,
             );
           }
-          metricKeys.add(recordKey);
-          // Window workers share this budget, but reserve it synchronously
-          // between awaits so another worker cannot pass the same capacity.
-          if (budget.remaining <= 0) {
-            throw new CursorApiError(
-              `Cursor API result exceeds the ${this.maxRecordCount.toLocaleString()}-record safety limit`,
-              502,
-            );
+          pageKeys.add(recordKey);
+          if (!previousPageKeys.has(recordKey)) madeProgress = true;
+          // Zero-usage metrics are not shown but still count as processed.
+          if (usage === 0) {
+            candidates.push({ date, bytes: 0 });
+            continue;
           }
-          budget.remaining -= 1;
-          if (usage === 0) continue;
-
           const record: McpRecord = {
             date,
             userId: idByEmail.get(email) || email,
@@ -748,31 +844,329 @@ export class CursorApiClient {
             usage,
             origin: classifyMcpServer(server),
           };
-          const recordBytes =
-            Buffer.byteLength(JSON.stringify(record), "utf8") + 1;
-          if (recordBytes > budget.remainingBytes) {
-            throw new CursorApiError(
-              "Cursor API analytics exceed the configured response-size safety limit",
-              502,
-            );
-          }
-          budget.remainingBytes -= recordBytes;
-          records.push(record);
+          candidates.push({ date, record, bytes: recordBytes(record) });
         }
       }
+
+      // Capacity is read once per page; page processing is synchronous, so
+      // no other window can consume it before this page is accounted for.
+      const allowance = hooks.allowance();
+      const pageBytes = candidates.reduce(
+        (total, candidate) => total + candidate.bytes,
+        0,
+      );
+      let outcome: WindowOutcome = "complete";
+      let usedRecords = candidates.length;
+      let usedBytes = pageBytes;
+      const records: McpRecord[] = [];
+      if (
+        candidates.length <= allowance.records &&
+        pageBytes <= allowance.bytes
+      ) {
+        for (const candidate of candidates) {
+          if (candidate.record) records.push(candidate.record);
+        }
+      } else {
+        // Keep the newest days of a page that does not fit.
+        candidates.sort((a, b) => b.date.localeCompare(a.date));
+        usedRecords = 0;
+        usedBytes = 0;
+        for (const candidate of candidates) {
+          if (usedRecords >= allowance.records) {
+            outcome = "records";
+            break;
+          }
+          if (usedBytes + candidate.bytes > allowance.bytes) {
+            outcome = "bytes";
+            break;
+          }
+          usedRecords += 1;
+          usedBytes += candidate.bytes;
+          if (candidate.record) records.push(candidate.record);
+        }
+      }
+
+      hooks.consume(usedRecords, usedBytes);
+      await hooks.write(records);
+      if (outcome !== "complete") return outcome;
 
       const nextCount = nextNoProgressCount(
         pagination,
         page,
         itemCount,
-        metricKeys.size > metricCountBefore,
+        madeProgress,
         noProgressPages,
       );
-      if (nextCount === null) break;
+      if (nextCount === null) return "complete";
       noProgressPages = nextCount;
+      previousPageKeys = pageKeys;
     }
+  }
 
-    return records;
+  private activityLimitValue(
+    reason: ActivityLimitReason,
+    deadlineMs: number,
+  ): number {
+    switch (reason) {
+      case "records":
+        return this.limits.maxRecords;
+      case "bytes":
+        return this.limits.maxResponseBytes;
+      case "page":
+        return this.limits.maxPageBytes;
+      case "timeout":
+        return deadlineMs;
+    }
+  }
+
+  /**
+   * Collects fetch windows newest first, four at a time. A window that
+   * reaches a cap stops, windows older than it are abandoned, and newer
+   * windows run to completion so the newest days stay complete.
+   */
+  private async collectSegments(
+    segments: CollectionSegment[],
+    run: McpRun,
+    memberNames: Map<string, string>,
+    options: McpDatasetOptions,
+    cachedDays: number,
+  ): Promise<void> {
+    const { onProgress, signal, deadline } = options;
+    const fetchIndexes = segments.flatMap((segment, index) =>
+      segment.kind === "fetch" ? [index] : [],
+    );
+    const totalWindows = fetchIndexes.length;
+    let completedWindows = 0;
+    const report = () =>
+      onProgress?.({
+        completedWindows,
+        totalWindows,
+        ...(cachedDays > 0 ? { cachedDays } : {}),
+      });
+    report();
+    if (totalWindows === 0) return;
+
+    let boundary = segments.length;
+    let failed = false;
+    let firstError: unknown;
+    const failure = new AbortController();
+    const baseSignal = signal
+      ? AbortSignal.any([signal, failure.signal])
+      : failure.signal;
+    const controllers = new Map<number, AbortController>();
+    const newerTotals = (index: number) => {
+      let records = 0;
+      let bytes = 0;
+      for (let other = 0; other < index; other += 1) {
+        records += segments[other]?.processed ?? 0;
+        bytes += segments[other]?.bytes ?? 0;
+      }
+      return { records, bytes };
+    };
+    const truncate = (index: number, reason: ActivityLimitReason) => {
+      const segment = segments[index];
+      if (!segment) return;
+      segment.status = "truncated";
+      segment.reason = reason;
+      if (index < boundary) boundary = index;
+      for (const [other, controller] of controllers) {
+        if (other > index) {
+          controller.abort(
+            new DOMException(
+              "Window is beyond the result boundary",
+              "AbortError",
+            ),
+          );
+        }
+      }
+    };
+
+    let nextQueueIndex = 0;
+    const worker = async () => {
+      for (;;) {
+        if (failed || baseSignal.aborted || deadline?.aborted) return;
+        const index = fetchIndexes[nextQueueIndex];
+        nextQueueIndex += 1;
+        if (index === undefined) return;
+        const segment = segments[index];
+        if (!segment) return;
+        if (index > boundary) {
+          segment.status = "abandoned";
+          completedWindows += 1;
+          report();
+          continue;
+        }
+        const controller = new AbortController();
+        controllers.set(index, controller);
+        const windowSignal = AbortSignal.any([
+          baseSignal,
+          controller.signal,
+          ...(deadline ? [deadline] : []),
+        ]);
+        segment.status = "running";
+        try {
+          const outcome = await this.fetchMcpWindow(
+            segment.startDate,
+            segment.endDate,
+            memberNames,
+            {
+              allowance: () => {
+                if (index > boundary) return { records: 0, bytes: 0 };
+                const newer = newerTotals(index);
+                return {
+                  records: Math.max(
+                    0,
+                    this.limits.maxRecords - newer.records - segment.processed,
+                  ),
+                  bytes: Math.max(
+                    0,
+                    this.limits.maxResponseBytes - newer.bytes - segment.bytes,
+                  ),
+                };
+              },
+              consume: (records, bytes) => {
+                segment.processed += records;
+                segment.bytes += bytes;
+              },
+              write: (records) => run.write(records),
+            },
+            windowSignal,
+          );
+          if (outcome === "complete") {
+            segment.days = await run.sealWindow(segment.dates, true);
+            segment.status = "complete";
+          } else if (index > boundary) {
+            segment.status = "abandoned";
+          } else {
+            truncate(index, outcome);
+            segment.days = await run.sealWindow(segment.dates, false);
+          }
+        } catch (error) {
+          if (signal?.aborted || failed) return;
+          if (isDeadlineAbort(deadline, signal)) {
+            truncate(index, "timeout");
+            segment.days = await run.sealWindow(segment.dates, false);
+          } else if (controller.signal.aborted) {
+            segment.status = "abandoned";
+          } else if (error instanceof PageLimitError) {
+            truncate(index, "page");
+            segment.days = await run.sealWindow(segment.dates, false);
+          } else {
+            failed = true;
+            firstError = error;
+            failure.abort(error);
+            return;
+          }
+        } finally {
+          controllers.delete(index);
+        }
+        completedWindows += 1;
+        report();
+      }
+    };
+
+    const results = await Promise.allSettled(
+      Array.from({ length: Math.min(WINDOW_CONCURRENCY, totalWindows) }, () =>
+        worker(),
+      ),
+    );
+    if (failed) throw firstError;
+    signal?.throwIfAborted();
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
+    const fallbackReason: ActivityLimitReason = deadline?.aborted
+      ? "timeout"
+      : (segments[boundary]?.reason ?? "records");
+    for (const segment of segments) {
+      if (segment.status === "pending" || segment.status === "running") {
+        segment.status = "truncated";
+        segment.reason = fallbackReason;
+      }
+    }
+  }
+
+  /**
+   * Collects MCP activity for a range into a dataset that can be read one
+   * day at a time. With a run factory, valid cached days are reused and only
+   * the remaining days are fetched. Reaching a cap or the deadline yields a
+   * partial dataset with a notice rather than an error.
+   */
+  async fetchMcpDataset(
+    startDate: string,
+    endDate: string,
+    options: McpDatasetOptions = {},
+  ): Promise<McpDataset> {
+    const run = options.runs
+      ? await options.runs.beginRun()
+      : new MemoryMcpRun();
+    try {
+      const dates = datesBetween(startDate, endDate);
+      const cached = await run.adoptCachedDays(dates);
+      const segments = buildSegments(dates, cached, WINDOW_DAYS);
+      await this.collectSegments(
+        segments,
+        run,
+        options.memberNames ?? new Map(),
+        options,
+        cached.size,
+      );
+      const plan = planIncludedDays(segments, {
+        maxRecords: this.limits.maxRecords,
+        maxBytes: this.limits.maxResponseBytes,
+      });
+      const days = [];
+      for (const day of plan.days) {
+        if (day.maxBytes === undefined) {
+          days.push(
+            day.limit === undefined
+              ? { date: day.date }
+              : { date: day.date, limit: day.limit },
+          );
+          continue;
+        }
+        const limit = await run.countWithinBytes(
+          day.date,
+          day.limit ?? Number.MAX_SAFE_INTEGER,
+          day.maxBytes,
+        );
+        if (limit > 0) days.push({ date: day.date, limit });
+      }
+      const range = { startDate, endDate };
+      const notices = plan.limit
+        ? [
+            activityLimitNotice(
+              plan.limit.reason,
+              this.activityLimitValue(
+                plan.limit.reason,
+                options.deadlineMs ?? 0,
+              ),
+              range,
+              plan.limit.completeFrom,
+            ),
+          ]
+        : [];
+      const teamId = this.teamId;
+      return run.createDataset(days, {
+        range,
+        generatedAt: new Date().toISOString(),
+        ...(teamId || this.teamName
+          ? {
+              team: {
+                id: teamId,
+                name: this.teamName || (teamId ? `Team ${teamId}` : "Team"),
+              },
+            }
+          : {}),
+        notices,
+      });
+    } catch (error) {
+      await run.discard().catch(() => undefined);
+      if (error instanceof DuplicateMetricError) {
+        throw new CursorApiError(error.message, 502);
+      }
+      throw error;
+    }
   }
 
   async fetchMcp(
@@ -781,140 +1175,69 @@ export class CursorApiClient {
     memberNames = new Map<string, string>(),
     onProgress?: (progress: McpFetchProgress) => void,
     signal?: AbortSignal,
+    deadline?: { signal: AbortSignal; milliseconds: number },
   ): Promise<McpResponse> {
-    const windows: Array<{ startDate: string; endDate: string }> = [];
-    const finalDate = new Date(`${endDate}T00:00:00.000Z`);
-    let windowStart = new Date(`${startDate}T00:00:00.000Z`);
-
-    while (windowStart <= finalDate) {
-      const windowEnd = new Date(windowStart);
-      windowEnd.setUTCDate(windowEnd.getUTCDate() + 29);
-      if (windowEnd > finalDate) windowEnd.setTime(finalDate.getTime());
-      const chunkStartDate = windowStart.toISOString().slice(0, 10);
-      const chunkEndDate = windowEnd.toISOString().slice(0, 10);
-      windows.push({ startDate: chunkStartDate, endDate: chunkEndDate });
-
-      windowStart = new Date(windowEnd);
-      windowStart.setUTCDate(windowStart.getUTCDate() + 1);
+    const dataset = await this.fetchMcpDataset(startDate, endDate, {
+      memberNames,
+      onProgress,
+      signal,
+      deadline: deadline?.signal,
+      deadlineMs: deadline?.milliseconds,
+    });
+    const records: McpRecord[] = [];
+    for await (const day of dataset.readDays("ascending")) {
+      for (const record of day.records) records.push(record);
     }
-
-    let completedWindows = 0;
-    const budget: RecordBudget = {
-      remaining: Math.max(1, Math.floor(this.maxRecordCount)),
-      remainingBytes: this.limits.maxResponseBytes,
-    };
-    onProgress?.({ completedWindows, totalWindows: windows.length });
-    const siblingController = new AbortController();
-    const windowSignal = signal
-      ? AbortSignal.any([signal, siblingController.signal])
-      : siblingController.signal;
-    let firstError: unknown;
-    let hasFirstError = false;
-    let windowRecords: McpRecord[][];
-    try {
-      windowRecords = await mapWithConcurrency(
-        windows,
-        WINDOW_CONCURRENCY,
-        async (window) => {
-          try {
-            const records = await this.fetchMcpWindow(
-              window.startDate,
-              window.endDate,
-              memberNames,
-              budget,
-              windowSignal,
-            );
-            completedWindows += 1;
-            onProgress?.({
-              completedWindows,
-              totalWindows: windows.length,
-            });
-            return records;
-          } catch (error) {
-            if (!hasFirstError) {
-              hasFirstError = true;
-              firstError = error;
-              siblingController.abort(error);
-            }
-            throw firstError;
-          }
-        },
-        windowSignal,
-      );
-    } catch (error) {
-      throw hasFirstError ? firstError : error;
-    }
-    const records = windowRecords.flat();
-    if (records.length > this.maxRecordCount) {
-      throw new CursorApiError(
-        `Cursor API result exceeds the ${this.maxRecordCount.toLocaleString()}-record safety limit`,
-        502,
-      );
-    }
-    const teamId = this.teamId;
-
-    records.sort(
-      (a, b) =>
-        a.date.localeCompare(b.date) ||
-        a.server.localeCompare(b.server) ||
-        a.email.localeCompare(b.email) ||
-        a.tool.localeCompare(b.tool),
-    );
-
     return {
       records,
       summary: summarizeMcpRecords(records),
-      range: { startDate, endDate },
-      generatedAt: new Date().toISOString(),
+      range: dataset.range,
+      generatedAt: dataset.generatedAt,
       source: "live",
-      team:
-        teamId || this.teamName
-          ? {
-              id: teamId,
-              name: this.teamName || (teamId ? `Team ${teamId}` : "Team"),
-              memberCount: 0,
-              groupCount: 0,
-            }
-          : undefined,
+      team: dataset.team
+        ? { ...dataset.team, memberCount: 0, groupCount: 0 }
+        : undefined,
+      ...(dataset.notices.length > 0 ? { notices: dataset.notices } : {}),
     };
   }
 }
 
-export function enrichMcpResponse(
-  response: McpResponse,
-  metadata: TeamMetadata,
-  teamName = "",
-  maxGroupAssignments: number = DEFAULT_CURSOR_API_LIMITS.maxEnrichedGroupAssignments,
-): McpResponse {
-  const assignmentLimit = Math.max(1, Math.floor(maxGroupAssignments));
-  let groupAssignments = 0;
-  const records = response.records.map((record) => {
-    const user = metadata.users.get(record.email);
-    if (!user) return record;
-    groupAssignments += user.directoryGroups.length;
-    if (groupAssignments > assignmentLimit) {
-      throw new CursorApiError(
-        "Enriched group assignments exceed the configured safety limit",
-        502,
-      );
-    }
-    return {
-      ...record,
-      displayName: user.name,
-      role: user.role,
-      directoryGroups: [...user.directoryGroups],
-    };
-  });
-  const teamId = response.team?.id ?? "";
-  return {
-    ...response,
-    records,
-    team: {
-      id: teamId,
-      name:
-        teamName || response.team?.name || (teamId ? `Team ${teamId}` : "Team"),
-      memberCount: metadata.memberCount,
-      groupCount: metadata.groupNames.length,
+type DirectoryLimitReason = "groups" | "memberships" | "page" | "timeout";
+
+function directoryLimitNotice(
+  reason: DirectoryLimitReason,
+  limit: number,
+): McpResponseNotice {
+  const details: Record<
+    DirectoryLimitReason,
+    { setting: string; cause: string; scope: string }
+  > = {
+    groups: {
+      setting: "MAX_DIRECTORY_GROUPS",
+      cause: `the ${formatCount(limit)}-group limit`,
+      scope: "every group",
     },
+    memberships: {
+      setting: "MAX_GROUP_MEMBERSHIPS",
+      cause: `the ${formatCount(limit)}-membership limit`,
+      scope: "every membership",
+    },
+    page: {
+      setting: "MAX_API_PAGE_BYTES",
+      cause: `the ${formatCount(limit)}-byte page limit`,
+      scope: "every group",
+    },
+    timeout: {
+      setting: "DIRECTORY_LOAD_TIMEOUT_MS",
+      cause: `the ${formatCount(limit)} ms directory time limit`,
+      scope: "every group",
+    },
+  };
+  const { setting, cause, scope } = details[reason];
+  return {
+    code: "LIMIT_REACHED",
+    message: `Directory groups are partial: ${cause} (${setting}) was reached. Raise ${setting} to load ${scope}. Activity totals are not affected.`,
+    setting,
+    limit,
   };
 }

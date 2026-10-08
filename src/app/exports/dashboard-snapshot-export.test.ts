@@ -43,6 +43,23 @@ describe("HTML snapshot generation", () => {
     expect(html).not.toContain("<Alex>");
   });
 
+  it("keeps limit notices but drops a pending directory load", () => {
+    const html = buildSnapshotHtml("<html><head></head></html>", {
+      ...payload,
+      notices: [
+        {
+          code: "LIMIT_REACHED",
+          message: "Partial.",
+          setting: "MAX_MCP_RECORDS",
+        },
+        { code: "DIRECTORY_LOADING", message: "Loading." },
+      ],
+    });
+
+    expect(html).toContain('"code":"LIMIT_REACHED"');
+    expect(html).not.toContain("DIRECTORY_LOADING");
+  });
+
   it("rejects payloads that resemble API credentials", () => {
     const unsafe = {
       ...payload,

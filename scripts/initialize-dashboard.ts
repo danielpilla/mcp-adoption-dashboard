@@ -4,6 +4,7 @@ import {
   assertNetworkBindingAllowed,
   parsePortValue,
 } from "../src/server/configuration/server-configuration.js";
+import { readRuntimeSettings } from "../src/server/configuration/runtime-settings.js";
 import {
   CursorApiClient,
   CursorApiError,
@@ -17,7 +18,6 @@ import {
 export { renderEnv, renderEnvWithApiKey };
 
 const ENV_PATH = resolve(".env");
-const VALIDATION_TIMEOUT_MS = 5 * 60_000;
 const SECURE_PROMPT_ERROR =
   "Secure hidden input requires an interactive TTY. Set CURSOR_API_KEY in a protected environment file (for example, a mode-600 .env) instead. Do not pass the key in command arguments or pipe or echo it into this command.";
 
@@ -222,13 +222,19 @@ export async function runInit(args = process.argv.slice(2)): Promise<void> {
   if (!apiKey) throw new Error("An API key is required.");
 
   console.log("Validating access with Cursor...");
-  const metadata = await new CursorApiClient(apiKey).fetchTeamMetadata(
-    AbortSignal.timeout(VALIDATION_TIMEOUT_MS),
+  const { validationTimeoutMs } = readRuntimeSettings(process.env);
+  const { teamId } = await new CursorApiClient(apiKey).validateApiKey(
+    AbortSignal.timeout(validationTimeoutMs),
   );
   await writeApiKeyEnv(ENV_PATH, apiKey, options);
 
   console.log(
-    `Connected successfully: ${metadata.memberCount} members and ${metadata.groupNames.length} groups.`,
+    teamId
+      ? `Connected successfully to team ${teamId}.`
+      : "Connected successfully.",
+  );
+  console.log(
+    "Team members and directory groups load in the background when the dashboard starts.",
   );
   console.log("Saved .env with owner-only permissions.");
   if (options.port !== undefined) {
@@ -254,7 +260,7 @@ if (import.meta.url === invokedPath) {
       );
     } else if (error instanceof DOMException && error.name === "TimeoutError") {
       console.error(
-        "Cursor API validation timed out after five minutes. Check network access and try again.",
+        "Cursor API validation timed out. Check network access, or raise VALIDATION_TIMEOUT_MS, and try again.",
       );
     } else {
       console.error(error instanceof Error ? error.message : "Setup failed.");

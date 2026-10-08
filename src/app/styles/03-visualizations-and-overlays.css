@@ -1770,3 +1770,70 @@ th[aria-sort] .pivot-column-sort {
 .drawer-header .eyebrow {
   margin: 0 0 5px;
 }
+
+.notice-state {
+  min-height: 0;
+  align-items: flex-start;
+  border-color: rgba(240, 190, 90, 0.28);
+}
+
+.notice-state .state-icon {
+  color: #f5cf86;
+  border-color: rgba(240, 190, 90, 0.28);
+  background: rgba(150, 104, 24, 0.16);
+}
+
+.notice-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.notice-list li {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+
+.notice-list button {
+  height: 28px;
+  padding: 0 12px;
+  color: white;
+  border: 1px solid rgba(66, 166, 240, 0.28);
+  border-radius: 8px;
+  background: rgba(6, 113, 216, 0.24);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.setup-directory-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(105, 179, 228, 0.12);
+}
+
+.setup-directory-progress > div {
+  display: grid;
+  gap: 4px;
+}
+
+.setup-directory-progress strong {
+  color: #d7e8f3;
+  font-size: 11px;
+}
+
+.setup-directory-progress small {
+  color: #738da1;
+  font-size: 9px;
+}
+
+.setup-directory-progress b {
+  color: #83cff9;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}

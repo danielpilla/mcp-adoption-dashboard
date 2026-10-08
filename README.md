@@ -60,19 +60,41 @@ inspection may expose it. For non-interactive deployments, provide
 The server loads `.env` when present. [`.env.example`](.env.example) is the
 complete application configuration reference.
 
-| Variable                         | Type             | Default     | Required                  | Purpose                                                                   |
-| -------------------------------- | ---------------- | ----------- | ------------------------- | ------------------------------------------------------------------------- |
-| `CURSOR_API_KEY`                 | string           | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                              |
-| `CURSOR_TEAM_NAME`               | string           | empty       | No                        | Display label because the API returns a team ID, not its display name.    |
-| `PORT`                           | integer          | `5173`      | No                        | Vite development UI port.                                                 |
-| `SERVER_PORT`                    | integer          | `4173`      | No                        | API and production application port.                                      |
-| `BIND_HOST`                      | hostname or IP   | `127.0.0.1` | No                        | Network interface used by development and production servers.             |
-| `ALLOW_UNAUTHENTICATED_NETWORK`  | literal `1`      | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control. |
-| `INTERNAL_MCP_SERVERS`           | comma-separated  | empty       | No                        | Additional organization-specific MCP labels classified as internal.       |
-| `MAX_MCP_RESPONSE_BYTES`         | positive integer | `134217728` | No                        | Maximum estimated analytics response size.                                |
-| `MAX_DIRECTORY_GROUPS`           | positive integer | `10000`     | No                        | Maximum directory groups accepted from Cursor.                            |
-| `MAX_GROUP_MEMBERSHIPS`          | positive integer | `250000`    | No                        | Maximum directory-group memberships accepted from Cursor.                 |
-| `MAX_ENRICHED_GROUP_ASSIGNMENTS` | positive integer | `250000`    | No                        | Maximum group assignments copied onto activity records.                   |
+| Variable                        | Type            | Default     | Required                  | Purpose                                                                   |
+| ------------------------------- | --------------- | ----------- | ------------------------- | ------------------------------------------------------------------------- |
+| `CURSOR_API_KEY`                | string          | none        | Yes, to load Cursor data  | Cursor Team Admin API key; kept server-side.                              |
+| `CURSOR_TEAM_NAME`              | string          | empty       | No                        | Display label because the API returns a team ID, not its display name.    |
+| `PORT`                          | integer         | `5173`      | No                        | Vite development UI port.                                                 |
+| `SERVER_PORT`                   | integer         | `4173`      | No                        | API and production application port.                                      |
+| `BIND_HOST`                     | hostname or IP  | `127.0.0.1` | No                        | Network interface used by development and production servers.             |
+| `ALLOW_UNAUTHENTICATED_NETWORK` | literal `1`     | unset       | For any non-loopback bind | Explicitly acknowledges network exposure; it does not add access control. |
+| `INTERNAL_MCP_SERVERS`          | comma-separated | empty       | No                        | Additional organization-specific MCP labels classified as internal.       |
+
+### Optional caps and timeouts
+
+Every cap below is optional. Defaults are high enough that they are not reached
+in normal use; set a lower value to bound memory, disk, or request time. When a
+cap is reached the dashboard keeps working: it shows the data loaded so far,
+newest days first, with a notice that names the setting to raise and the
+shorter range that would be complete.
+
+| Variable                         | Type                 | Default               | Purpose                                                                                   |
+| -------------------------------- | -------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `MAX_MCP_RECORDS`                | positive integer     | `100000000`           | Maximum activity rows processed for one date range, including zero-usage rows.            |
+| `MAX_MCP_RESPONSE_BYTES`         | positive integer     | `25600000000`         | Maximum serialized size of the activity rows in one result (about 256 bytes per row).     |
+| `MAX_API_PAGE_BYTES`             | positive integer     | `67108864`            | Maximum size of one Cursor API response page.                                             |
+| `MAX_DIRECTORY_GROUPS`           | positive integer     | `1000000`             | Maximum directory groups loaded from Cursor.                                              |
+| `MAX_GROUP_MEMBERSHIPS`          | positive integer     | `100000000`           | Maximum directory-group memberships loaded from Cursor.                                   |
+| `MAX_ENRICHED_GROUP_ASSIGNMENTS` | positive integer     | `1000000000`          | Maximum group names attached to activity rows in one result; the newest rows keep groups. |
+| `MAX_CACHED_RECORDS`             | positive integer     | `100000000`           | Maximum activity rows held across settled results in the 12-hour result cache.            |
+| `VALIDATION_TIMEOUT_MS`          | positive integer     | `300000`              | Time allowed for the single request that validates an API key.                            |
+| `ANALYTICS_TIMEOUT_MS`           | positive integer     | `7200000`             | Time allowed to load one date range; days loaded before it passes are shown.              |
+| `DIRECTORY_LOAD_TIMEOUT_MS`      | positive integer     | `86400000`            | Time allowed for the background directory load; groups loaded before it passes are kept.  |
+| `MCP_CACHE_DIR`                  | path                 | `.cache/mcp-activity` | Directory for the per-day activity cache, relative to the working directory.              |
+| `MCP_CACHE_MAX_BYTES`            | positive integer     | `25600000000`         | Maximum size of the per-day activity cache; the oldest days are evicted first.            |
+| `MCP_CACHE_REFETCH_DAYS`         | non-negative integer | `2`                   | Days before today that are always refetched; today is always refetched.                   |
+
+Timeouts cannot exceed `2147483647` milliseconds.
 
 `CHROME_PATH` can select a system Chrome executable for the browser smoke test.
 `SMOKE_TEST_DATE` can pin that test's synthetic reference date; neither is
@@ -92,7 +114,13 @@ application configuration.
    data.
 
 The Refresh action bypasses the 12-hour settled-result cache. Repeated refreshes
-of the same range within 10 seconds return HTTP 429.
+of the same range within 10 seconds return HTTP 429. Completed days older than
+the refetch window are kept in the per-day activity cache, so a refresh or a
+later range fetches only the days that are not cached yet.
+
+Directory groups load in the background after the API key is validated. The
+dashboard opens without waiting; names, roles, and group filters appear when
+the directory finishes loading.
 
 After starting the production server, its liveness endpoint is:
 
@@ -106,7 +134,8 @@ See [docs/usage.md](docs/usage.md) for interaction details and
 ## Architecture
 
 The application has a React/Vite browser runtime and an Express server runtime.
-It uses `.env` plus bounded in-memory caches; there is no analytics database.
+It uses `.env`, bounded in-memory caches, and a size-capped per-day activity
+cache on disk (`MCP_CACHE_DIR`); there is no analytics database.
 
 ```mermaid
 flowchart LR
@@ -114,6 +143,7 @@ flowchart LR
   Browser["React dashboard"] -->|"GET /api/mcp or stream"| HTTP
   HTTP -->|"validated date range"| Coordinator["Request coalescing and cache"]
   Coordinator --> Client["Cursor API client"]
+  Client <-->|"completed days"| DayCache["Per-day activity cache"]
   Client -->|"30-day windows"| Analytics["Cursor Analytics API"]
   Client -->|"members and groups"| Admin["Cursor Admin API"]
   Contracts["Shared MCP contracts"] --> Browser
@@ -127,6 +157,7 @@ sequenceDiagram
   participant HTTP as Express server
   participant Cache as In-memory cache
   participant Client as Cursor API client
+  participant Days as Per-day cache
   participant Analytics as Analytics API
   participant Admin as Admin API
 
@@ -136,20 +167,17 @@ sequenceDiagram
   alt Settled cache hit
     Cache-->>HTTP: Validated MCP response
   else Cache miss
-    par Activity windows
-      HTTP->>Client: fetchMcp(startDate, endDate)
-      Client->>Analytics: Paginated 30-day windows
-      Analytics-->>Client: MCP activity
-    and Team metadata
-      HTTP->>Client: fetchTeamMetadata()
-      Client->>Admin: Members and directory groups
-      Admin-->>Client: Team metadata
-    end
-    Client-->>HTTP: Validated bounded results
-    HTTP->>HTTP: Enrich and summarize records
-    HTTP->>Cache: Store settled response
+    HTTP->>Client: fetchMcpDataset(startDate, endDate)
+    Client->>Days: Reuse completed days
+    Client->>Analytics: Uncached days, newest 30-day windows first
+    Analytics-->>Client: MCP activity
+    Client->>Days: Store completed days
+    Client-->>HTTP: Day-by-day dataset and any cap notice
+    HTTP->>Cache: Store settled dataset
   end
-  HTTP-->>Browser: MCP response
+  Note over HTTP,Admin: Directory groups load in the background
+  HTTP->>HTTP: Enrich and summarize one day at a time
+  HTTP-->>Browser: Streamed MCP response
   Browser->>Browser: Filter and visualize in memory
 ```
 
@@ -232,6 +260,10 @@ an access-control mechanism.
 - **The browser smoke test cannot launch Chromium:** run the documented
   Playwright install command or set `CHROME_PATH`.
 - **Installation reports an unsupported engine:** use Node.js 20.19 or newer.
+- **The dashboard shows partial data:** the notice names the cap that was
+  reached. Raise that setting, or choose the shorter range the notice suggests.
+- **The activity cache should be rebuilt:** stop the server and delete
+  `MCP_CACHE_DIR`. Changing the API key clears it automatically.
 
 ## License
 

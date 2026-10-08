@@ -17,6 +17,10 @@ import {
   optionalString,
   readJsonObject,
 } from "../dashboard/dashboard-api-client";
+import {
+  describeDirectoryProgress,
+  directoryProgressRatio,
+} from "../dashboard/directory-progress";
 import { Icon } from "../interface/icon";
 import { useDialogFocusTrap } from "../interface/dialog-focus-trap";
 
@@ -33,6 +37,27 @@ type SetupView =
   | "required"
   | "blocked"
   | "error";
+
+function DirectoryProgressRow({
+  progress,
+}: {
+  progress: NonNullable<DashboardLoadProgress["directory"]>;
+}) {
+  const ratio = directoryProgressRatio(progress);
+  return (
+    <div className="setup-directory-progress">
+      <div>
+        <strong>Directory groups</strong>
+        <small>
+          {describeDirectoryProgress(progress)}
+          {progress.status === "loading" &&
+            " · loads in the background; the dashboard opens without waiting"}
+        </small>
+      </div>
+      {ratio !== null && <b>{Math.round(ratio * 100)}%</b>}
+    </div>
+  );
+}
 
 export function SetupGate({
   initialData,
@@ -376,6 +401,10 @@ export function SetupGate({
                     }}
                   />
                 </div>
+                {loadProgress.directory &&
+                  loadProgress.directory.status !== "disabled" && (
+                    <DirectoryProgressRow progress={loadProgress.directory} />
+                  )}
               </div>
             )}
 
